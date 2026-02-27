@@ -1,0 +1,31 @@
+[package]
+name = "mimir"
+version = "0.1.0"
+edition = "2024"
+authors = ["Revertron"]
+description = "Mimir messaging networking library (P2P + mediator)"
+license = "LGPL-3.0"
+
+[dependencies]
+ygg_stream   = { path = "../ygg_stream" }
+tokio        = { version = "1", features = ["full"] }
+uniffi       = { version = "0.31.0", features = ["build", "cli"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand         = "0.8"
+thiserror    = "2"
+serde_json   = "1"
+hex          = "0.4"
+log          = "0.4"
+
+[build-dependencies]
+uniffi = { version = "0.31.0", features = ["build"] }
+
+[lib]
+name = "mimir"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+test = false

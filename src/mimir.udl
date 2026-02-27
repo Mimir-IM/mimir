@@ -1,0 +1,163 @@
+namespace mimir {};
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+[Error]
+enum MimirError {
+    "Connection",
+    "Auth",
+    "Protocol",
+    "Crypto",
+    "Io",
+};
+
+// ── Shared data types ─────────────────────────────────────────────────────────
+
+/// Contact profile info exchanged with peers on every connection.
+dictionary ContactInfo {
+    string  nickname;
+    string  info;
+    bytes?  avatar;
+    u64     update_time;
+};
+
+enum CallStatus {
+    "Idle",
+    "Calling",    // We started a call, waiting for answer
+    "Receiving",  // Incoming call, waiting for us to answer
+    "InCall",     // Active call
+    "Hangup",     // Call ended
+};
+
+// ── Callback interfaces (implemented by Kotlin/Swift) ─────────────────────────
+
+/// Provides local user info and stores contact info received from peers.
+/// All methods are called from Rust connection tasks — must not block long.
+callback interface InfoProvider {
+    /// Return our current contact info if it was updated after `since_time`,
+    /// or null if nothing changed (so we skip sending an update).
+    ContactInfo? get_my_info(u64 since_time);
+
+    /// Return the last known update timestamp for a peer's contact info.
+    /// Used to send an efficient info request ("only send if newer than X").
+    u64 get_contact_update_time(bytes pubkey);
+
+    /// Called when a peer sent us their updated contact info.
+    void update_contact_info(bytes pubkey, ContactInfo info);
+
+    /// Return the directory path where file attachments are stored.
+    /// Used when a received message includes a file payload to be saved.
+    string get_files_dir();
+};
+
+/// Receives P2P networking events. All callbacks are invoked from Rust
+/// connection tasks and must return quickly.
+callback interface PeerEventListener {
+    /// Mutual authentication succeeded; peer is ready to exchange messages.
+    void on_peer_connected(bytes pubkey, string address);
+
+    /// Connection to peer closed.
+    /// `dead_peer` = true if we detected the peer was unreachable (no pong).
+    void on_peer_disconnected(bytes pubkey, string address, boolean dead_peer);
+
+    /// A text/file message arrived from `pubkey`.
+    ///
+    /// For text (msg_type == 0 or 2): `data` is the message content.
+    /// For image/file (msg_type == 1 or 3): `data` is the raw wire payload —
+    /// [metaJsonSize(4 BE)][metaJson][fileBytes] — exactly as received.
+    void on_message_received(
+        bytes  pubkey,
+        u64    guid,
+        u64    reply_to,
+        u64    send_time,
+        u64    edit_time,
+        i32    msg_type,
+        bytes  data
+    );
+
+    /// The peer acknowledged receipt of our message with the given guid.
+    void on_message_delivered(bytes pubkey, u64 guid);
+
+    /// Peer is calling us.
+    void on_incoming_call(bytes pubkey);
+
+    /// Call state changed (Calling, InCall, Hangup, …).
+    /// `pubkey` is null only for Idle status.
+    void on_call_status_changed(CallStatus status, bytes? pubkey);
+
+    /// Raw audio packet from peer during an active call.
+    /// Passed through directly to the audio subsystem (stays in Kotlin/Swift
+    /// until audio moves to Rust in a later phase).
+    void on_call_packet(bytes pubkey, bytes data);
+};
+
+// ── Main object ───────────────────────────────────────────────────────────────
+
+/// Top-level P2P node.  One instance per app lifetime.
+///
+/// Constructor starts:
+///   - a Yggdrasil node with `signing_key` and `ygg_peers`
+///   - an accept loop listening on `peer_port` for inbound connections
+///
+/// All methods are thread-safe.
+interface PeerNode {
+    /// Create and start the node.
+    ///
+    /// `signing_key`    – 32-byte Ed25519 seed (private key).
+    /// `ygg_peers`      – Yggdrasil bootstrap peer URIs.
+    /// `peer_port`      – Port used for P2P connections (listen + outbound).
+    /// `event_listener` – Receives connection and message events.
+    /// `info_provider`  – Supplies and stores contact profile info.
+    [Throws=MimirError]
+    constructor(
+        bytes                signing_key,
+        sequence<string>     ygg_peers,
+        u16                  peer_port,
+        PeerEventListener    event_listener,
+        InfoProvider         info_provider
+    );
+
+    /// Our 32-byte Ed25519 public key (= Yggdrasil identity).
+    bytes public_key();
+
+    /// Queue a message for delivery to `pubkey`.
+    /// The connection must already exist (was established via connect_to_peer
+    /// or an inbound connection triggered on_peer_connected).
+    ///
+    /// For text (msg_type 0 or 2): pass message content as `data`.
+    /// For image/file (msg_type 1 or 3): pass the already-assembled wire
+    /// payload [metaJsonSize(4 BE)][metaJson][fileBytes] as `data`.
+    [Throws=MimirError]
+    void send_message(
+        bytes  pubkey,
+        u64    guid,
+        u64    reply_to,
+        u64    send_time,
+        u64    edit_time,
+        i32    msg_type,
+        bytes  data
+    );
+
+    /// Open an outbound connection to `pubkey`.
+    /// Returns immediately; on_peer_connected fires when auth completes.
+    [Throws=MimirError]
+    void connect_to_peer(bytes pubkey);
+
+    /// Close the connection to `pubkey` (if any).
+    void disconnect_peer(bytes pubkey);
+
+    /// Initiate an outgoing call to `pubkey`.
+    [Throws=MimirError]
+    void start_call(bytes pubkey);
+
+    /// Accept (true) or reject (false) an incoming call from `pubkey`.
+    [Throws=MimirError]
+    void answer_call(bytes pubkey, boolean accept);
+
+    /// Hang up an active or ringing call with `pubkey`.
+    [Throws=MimirError]
+    void hangup_call(bytes pubkey);
+
+    /// Stop the node and close all connections.
+    void stop();
+};
