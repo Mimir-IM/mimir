@@ -239,12 +239,19 @@ interface PeerNode {
         bytes                signing_key,
         sequence<string>     ygg_peers,
         u16                  peer_port,
+        sequence<string>     trackers,
         PeerEventListener    event_listener,
         InfoProvider         info_provider
     );
 
     /// Our 32-byte Ed25519 public key (= Yggdrasil identity).
     bytes public_key();
+
+    /// Announce our current ephemeral Yggdrasil address to all configured trackers.
+    ///
+    /// Returns immediately; I/O is done in the background.
+    /// Call once at startup and periodically to keep the tracker entry alive.
+    void announce_to_trackers();
 
     /// Queue a message for delivery to `pubkey`.
     /// The connection must already exist (was established via connect_to_peer

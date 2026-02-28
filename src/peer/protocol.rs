@@ -465,3 +465,48 @@ pub async fn write_call_packet(conn: &AsyncConn, data: &[u8]) -> Result<(), Mimi
     conn.write(&buf).await.map_err(|e| MimirError::Io(e))?;
     Ok(())
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_header_encodes_type_and_size() {
+        let h = build_header(MSG_TYPE_MESSAGE_TEXT, 1234i64);
+
+        // stream field (bytes 0-3) must be zero
+        assert_eq!(&h[0..4], &[0, 0, 0, 0]);
+
+        // msg_type at bytes 4-7
+        let msg_type = i32::from_be_bytes([h[4], h[5], h[6], h[7]]);
+        assert_eq!(msg_type, MSG_TYPE_MESSAGE_TEXT);
+
+        // size at bytes 8-15
+        let size = i64::from_be_bytes(h[8..16].try_into().unwrap());
+        assert_eq!(size, 1234i64);
+    }
+
+    #[test]
+    fn build_header_zero_size() {
+        let h = build_header(MSG_TYPE_PING, 0);
+        let size = i64::from_be_bytes(h[8..16].try_into().unwrap());
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn build_header_all_known_types_roundtrip() {
+        let types = [
+            MSG_TYPE_HELLO, MSG_TYPE_CHALLENGE, MSG_TYPE_CHALLENGE_ANSWER,
+            MSG_TYPE_CHALLENGE2, MSG_TYPE_CHALLENGE_ANSWER2,
+            MSG_TYPE_INFO_REQUEST, MSG_TYPE_INFO_RESPONSE,
+            MSG_TYPE_PING, MSG_TYPE_PONG,
+            MSG_TYPE_MESSAGE_TEXT, MSG_TYPE_OK,
+        ];
+        for &t in &types {
+            let h = build_header(t, 0);
+            assert_eq!(i32::from_be_bytes([h[4], h[5], h[6], h[7]]), t);
+        }
+    }
+}

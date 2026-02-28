@@ -218,3 +218,140 @@ fn key32<'a>(b: &'a [u8], name: &str) -> Result<[u8; 32], MimirError> {
         format!("{name} must be 32 bytes, got {}", b.len())
     ))
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    fn random_sk() -> SigningKey {
+        SigningKey::generate(&mut OsRng)
+    }
+
+    // ── generate_shared_key ───────────────────────────────────────────────────
+
+    #[test]
+    fn generate_shared_key_is_32_bytes() {
+        let key = generate_shared_key();
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn generate_shared_key_produces_different_keys() {
+        let k1 = generate_shared_key();
+        let k2 = generate_shared_key();
+        // Astronomically unlikely to be equal.
+        assert_ne!(k1, k2);
+    }
+
+    // ── encrypt_message / decrypt_message ─────────────────────────────────────
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let key  = generate_shared_key();
+        let text = b"hello, mimir!".to_vec();
+
+        let ct = encrypt_message(text.clone(), key.clone()).unwrap();
+        let pt = decrypt_message(ct, key).unwrap();
+
+        assert_eq!(pt, text);
+    }
+
+    #[test]
+    fn decrypt_with_wrong_key_fails() {
+        let key1 = generate_shared_key();
+        let key2 = generate_shared_key();
+        let ct   = encrypt_message(b"secret".to_vec(), key1).unwrap();
+        assert!(decrypt_message(ct, key2).is_err());
+    }
+
+    #[test]
+    fn decrypt_truncated_ciphertext_fails() {
+        // Anything shorter than 12 (nonce) + 16 (tag) = 28 bytes must fail.
+        let ct = vec![0u8; 20];
+        let key = generate_shared_key();
+        assert!(decrypt_message(ct, key).is_err());
+    }
+
+    #[test]
+    fn encrypt_message_output_is_nonce_plus_ciphertext() {
+        let key     = generate_shared_key();
+        let text    = b"test".to_vec();
+        let text_len = text.len();
+
+        let ct = encrypt_message(text, key).unwrap();
+        // nonce(12) + ciphertext(text_len) + tag(16)
+        assert_eq!(ct.len(), 12 + text_len + 16);
+    }
+
+    // ── encrypt_shared_key / decrypt_shared_key ───────────────────────────────
+
+    #[test]
+    fn ecies_roundtrip() {
+        let sk         = random_sk();
+        let shared_key = generate_shared_key();
+        let pk_bytes   = pubkey_of(&sk);
+        let seed_bytes = sk.to_bytes().to_vec();
+
+        let wrapped   = encrypt_shared_key(shared_key.clone(), pk_bytes.to_vec()).unwrap();
+        let unwrapped = decrypt_shared_key(wrapped, seed_bytes).unwrap();
+
+        assert_eq!(unwrapped, shared_key);
+    }
+
+    #[test]
+    fn ecies_wrong_seed_fails() {
+        let sk1        = random_sk();
+        let sk2        = random_sk();
+        let shared_key = generate_shared_key();
+        let pk1_bytes  = pubkey_of(&sk1);
+
+        let wrapped   = encrypt_shared_key(shared_key, pk1_bytes.to_vec()).unwrap();
+        let bad_seed  = sk2.to_bytes().to_vec();
+        // MAC will fail because the derived key is wrong.
+        assert!(decrypt_shared_key(wrapped, bad_seed).is_err());
+    }
+
+    #[test]
+    fn ecies_output_is_ephpub_nonce_ciphertext() {
+        let sk         = random_sk();
+        let shared_key = generate_shared_key(); // 32 bytes
+        let pk_bytes   = pubkey_of(&sk).to_vec();
+
+        let wrapped = encrypt_shared_key(shared_key, pk_bytes).unwrap();
+        // eph_pubkey(32) + nonce(12) + ciphertext(32) + tag(16) = 92
+        assert_eq!(wrapped.len(), 32 + 12 + 32 + 16);
+    }
+
+    // ── sign / verify ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let sk      = random_sk();
+        let pk      = pubkey_of(&sk);
+        let message = b"authenticate me";
+        let sig     = sign(&sk, message);
+
+        assert!(verify(&pk, message, &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_wrong_message_fails() {
+        let sk  = random_sk();
+        let pk  = pubkey_of(&sk);
+        let sig = sign(&sk, b"original");
+        assert!(verify(&pk, b"tampered", &sig).is_err());
+    }
+
+    #[test]
+    fn verify_wrong_key_fails() {
+        let sk1 = random_sk();
+        let sk2 = random_sk();
+        let pk2 = pubkey_of(&sk2);
+        let sig = sign(&sk1, b"message");
+        assert!(verify(&pk2, b"message", &sig).is_err());
+    }
+}

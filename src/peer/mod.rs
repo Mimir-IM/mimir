@@ -2,6 +2,7 @@
 
 pub mod connection;
 pub mod protocol;
+pub mod resolver;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,7 @@ use yggdrasil::links::PeerEvent;
 
 use crate::{CallStatus, InfoProvider, MimirError, PeerEventListener};
 use connection::{ConnContext, OutgoingCmd, run_inbound, run_outbound};
+use resolver::Resolver;
 
 // ── Peers map type alias ──────────────────────────────────────────────────────
 
@@ -81,6 +83,7 @@ struct PeerState {
     peers: Arc<PeersMap>,
     event_cb: Arc<dyn PeerEventListener>,
     info_cb: Arc<dyn InfoProvider>,
+    resolver: Arc<Resolver>,
 }
 
 impl PeerState {
@@ -144,7 +147,7 @@ impl PeerNode {
     /// * `peer_port`      – Port used for P2P connections (listen + outbound).
     /// * `event_listener` – Receives connection and message events.
     /// * `info_provider`  – Supplies and stores contact profile info.
-    pub fn new(signing_key: Vec<u8>, ygg_peers: Vec<String>, peer_port: u16, event_listener: Box<dyn PeerEventListener>, info_provider: Box<dyn InfoProvider>) -> Result<Self, MimirError> {
+    pub fn new(signing_key: Vec<u8>, ygg_peers: Vec<String>, peer_port: u16, trackers: Vec<String>, event_listener: Box<dyn PeerEventListener>, info_provider: Box<dyn InfoProvider>) -> Result<Self, MimirError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -174,15 +177,23 @@ impl PeerNode {
             inner: event_listener,
             peers: Arc::clone(&peers),
         });
+        let sk = Arc::new(sk);
+        let resolver = Arc::new(Resolver::new(
+            Arc::clone(&node),
+            Arc::clone(&sk),
+            peer_port,
+            &trackers,
+        ));
         let state = Arc::new(PeerState {
             our_pubkey,
-            signing_key: Arc::new(sk),
+            signing_key: Arc::clone(&sk),
             node: Arc::clone(&node),
             peer_port,
             client_id: 1,
             peers,
             event_cb: event_wrapper,
             info_cb: info_provider,
+            resolver,
         });
 
         // Spawn the inbound-accept loop.
@@ -301,18 +312,40 @@ impl PeerNode {
 
         let state = Arc::clone(&self.state);
         self.rt.spawn(async move {
-            match state.node.connect(&key, state.peer_port).await {
-                Ok(conn) => {
-                    let ctx = state.make_ctx();
-                    let conn = Arc::new(conn);
-                    if let Some(tx) = run_outbound(conn, key, ctx).await {
-                        state.register_peer(key, tx);
+            // Resolve the permanent pubkey to ephemeral Yggdrasil routing key(s).
+            // Try cached first; query trackers if cache is empty.
+            let mut ephemeral_keys = state.resolver.get_cached(&key);
+            if ephemeral_keys.is_empty() {
+                ephemeral_keys = state.resolver.query_trackers(&key).await;
+            }
+            // Fall back to treating the permanent key as the routing key directly
+            // (works when both keys are the same, i.e. single-key architecture).
+            if ephemeral_keys.is_empty() {
+                ephemeral_keys = vec![key];
+            }
+
+            for eph_key in ephemeral_keys {
+                match state.node.connect(&eph_key, state.peer_port).await {
+                    Ok(conn) => {
+                        let ctx = state.make_ctx();
+                        let conn = Arc::new(conn);
+                        // Identify the peer by their permanent pubkey for auth + map key.
+                        if let Some(tx) = run_outbound(conn, key, ctx).await {
+                            state.register_peer(key, tx);
+                        }
+                        return; // connected successfully
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "connect_to_peer {}: eph {} failed: {}",
+                            hex::encode(&key[..4]),
+                            hex::encode(&eph_key[..4]),
+                            e
+                        );
                     }
                 }
-                Err(e) => {
-                    log::error!("connect_to_peer {}: {}", hex::encode(key), e);
-                }
             }
+            log::error!("connect_to_peer {}: all addresses exhausted", hex::encode(&key[..4]));
         });
         Ok(())
     }
@@ -340,6 +373,18 @@ impl PeerNode {
     pub fn hangup_call(&self, pubkey: Vec<u8>) -> Result<(), MimirError> {
         let key = vec_to_key(&pubkey)?;
         self.state.send_cmd(&key, OutgoingCmd::HangupCall)
+    }
+
+    /// Announce our current ephemeral Yggdrasil address to all configured trackers.
+    ///
+    /// Returns immediately; the actual network I/O runs in the background.
+    /// Call this once after startup and periodically to keep the tracker entry
+    /// fresh (before the TTL expires).
+    pub fn announce_to_trackers(&self) {
+        let resolver = Arc::clone(&self.state.resolver);
+        self.rt.spawn(async move {
+            resolver.announce().await;
+        });
     }
 
     // ── Crate-internal accessors (used by MediatorNode) ──────────────────────
