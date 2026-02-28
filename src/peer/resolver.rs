@@ -171,9 +171,9 @@ impl Resolver {
     /// Announce our current ephemeral address (= `our_pubkey`) to all trackers.
     ///
     /// Fires-and-forgets from the caller's perspective — errors are only logged.
-    pub async fn announce(&self) {
+    pub async fn announce(&self) -> Result<i64, String> {
         if self.trackers.is_empty() {
-            return;
+            return Err(String::from("No useful trackers"));
         }
 
         let _lock = self.recv_lock.lock().await;
@@ -197,34 +197,24 @@ impl Resolver {
         frame.extend_from_slice(&sig);
 
         for tracker in &self.trackers {
-            if let Err(e) = self.node
-                .send_datagram(&tracker.pubkey, tracker.port, &frame)
-                .await
-            {
-                log::warn!(
-                    "resolver: announce send to {} failed: {e}",
-                    hex::encode(&tracker.pubkey[..4])
-                );
+            if let Err(e) = self.node.send_datagram(&tracker.pubkey, tracker.port, &frame).await {
+                log::warn!("resolver: announce send to {} failed: {e}", hex::encode(&tracker.pubkey[..4]));
                 continue;
             }
             // Best-effort read of TTL response (not required for correctness).
             match self.recv_matching(&tracker.pubkey, &nonce, CMD_ANNOUNCE).await {
                 Ok(payload) if payload.len() >= 8 => {
-                    let ttl = u64::from_be_bytes(payload[..8].try_into().unwrap());
-                    log::info!(
-                        "resolver: announced to {}, TTL={ttl}s",
-                        hex::encode(&tracker.pubkey[..4])
-                    );
+                    let ttl = i64::from_be_bytes(payload[..8].try_into().unwrap());
+                    log::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
+                    return Ok(ttl);
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    log::debug!(
-                        "resolver: no announce ack from {}: {e}",
-                        hex::encode(&tracker.pubkey[..4])
-                    );
+                    log::debug!("resolver: no announce ack from {}: {e}", hex::encode(&tracker.pubkey[..4]));
                 }
             }
         }
+        Err("announce failed".to_string())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

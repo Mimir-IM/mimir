@@ -5,10 +5,12 @@ pub mod protocol;
 pub mod resolver;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-
+use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::sleep;
 use ygg_stream::AsyncNode;
 
 
@@ -136,6 +138,10 @@ pub struct PeerNode {
     rt: Arc<tokio::runtime::Runtime>,
     state: Arc<PeerState>,
     stop_tx: broadcast::Sender<()>,
+    /// Guards against multiple concurrent announce loops.
+    announce_started: AtomicBool,
+    /// Wakes the announce loop from its inter-announcement sleep immediately.
+    announce_notify: Arc<tokio::sync::Notify>,
 }
 
 impl PeerNode {
@@ -278,6 +284,8 @@ impl PeerNode {
             rt: Arc::new(rt),
             state,
             stop_tx,
+            announce_started: AtomicBool::new(false),
+            announce_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -413,13 +421,39 @@ impl PeerNode {
 
     /// Announce our current ephemeral Yggdrasil address to all configured trackers.
     ///
-    /// Returns immediately; the actual network I/O runs in the background.
-    /// Call this once after startup and periodically to keep the tracker entry
-    /// fresh (before the TTL expires).
+    /// Returns immediately.  The first call starts the background announce loop;
+    /// every subsequent call wakes it from its inter-announcement sleep so it
+    /// re-announces right away (useful after a network change or on app resume).
     pub fn announce_to_trackers(&self) {
+        if self.announce_started.swap(true, Ordering::SeqCst) {
+            // Loop already running — just kick it to re-announce immediately.
+            self.announce_notify.notify_one();
+            return;
+        }
+
         let resolver = Arc::clone(&self.state.resolver);
+        let node = self.ygg_node().clone();
+        let notify = Arc::clone(&self.announce_notify);
+        let mut stop_rx = self.stop_tx.subscribe();
         self.rt.spawn(async move {
-            resolver.announce().await;
+            let pause = Duration::from_secs(60);
+            loop {
+                let delay = if node.count_active_peers().await > 0 {
+                    match resolver.announce().await {
+                        Ok(ttl) => Duration::from_secs(ttl as u64),
+                        Err(_)  => pause,
+                    }
+                } else {
+                    pause
+                };
+
+                tokio::select! {
+                    biased;
+                    _ = stop_rx.recv()    => break,
+                    _ = notify.notified() => {}   // re-announce immediately
+                    _ = sleep(delay)      => {}   // normal TTL expiry
+                }
+            }
         });
     }
 

@@ -134,9 +134,12 @@ impl MediatorNode {
 
     pub fn leave_chat(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
+        let hex = hex::encode(key);
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
-            client.leave_chat(chat_id).await
+            client.leave_chat(chat_id).await?;
+            self.manager.forget_subscription(&hex, chat_id);
+            Ok(())
         })
     }
 
@@ -152,11 +155,15 @@ impl MediatorNode {
 
     /// Subscribe to push messages for `chat_id`.
     /// Returns the server's last message ID (use to fetch missed messages).
+    /// The subscription is persisted locally so it is restored on reconnect.
     pub fn subscribe(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<i64, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
+        let hex = hex::encode(key);
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
-            client.subscribe(chat_id).await
+            let last_id = client.subscribe(chat_id).await?;
+            self.manager.remember_subscription(&hex, chat_id);
+            Ok(last_id)
         })
     }
 

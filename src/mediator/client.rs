@@ -11,7 +11,7 @@
 //! 3. `stop()` cancels both background tasks and closes the connection.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,12 @@ use super::protocol::*;
 
 // ── Timeouts ──────────────────────────────────────────────────────────────────
 
-const REQ_TIMEOUT:   Duration = Duration::from_secs(10);
+/// Timeout for control/query operations (auth, ping, subscribe, get_*, …).
+const REQ_TIMEOUT:  Duration = Duration::from_secs(10);
+/// Longer timeout for data-write operations (send_message) where the server
+/// may be busy but the request is genuinely processed — avoids false timeouts
+/// that leave messages marked unsent locally even though they were delivered.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(50);
 
 // ── Pending request map ───────────────────────────────────────────────────────
@@ -40,13 +45,16 @@ type PendingMap = Mutex<HashMap<u16, oneshot::Sender<Response>>>;
 /// Cheap to clone — all state is behind `Arc`.
 #[derive(Clone)]
 pub struct MediatorClient {
-    conn:            Arc<AsyncConn>,
-    pending:         Arc<PendingMap>,
-    write_mu:        Arc<Mutex<()>>,
-    next_id:         Arc<AtomicU64>,
+    conn:             Arc<AsyncConn>,
+    pending:          Arc<PendingMap>,
+    write_mu:         Arc<Mutex<()>>,
+    next_id:          Arc<AtomicU64>,
     last_activity_ms: Arc<AtomicU64>,
-    stop_tx:         broadcast::Sender<()>,
+    stop_tx:          broadcast::Sender<()>,
     pub mediator_pubkey: [u8; 32],
+    /// Set to true by whichever task (reader or ping) first detects disconnect.
+    /// Prevents double `on_disconnected` calls and stale map removals.
+    disconnected:     Arc<AtomicBool>,
 }
 
 impl MediatorClient {
@@ -65,23 +73,24 @@ impl MediatorClient {
         let (stop_tx, _) = broadcast::channel::<()>(1);
         let pending:  Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
         let write_mu: Arc<Mutex<()>>  = Arc::new(Mutex::new(()));
-        let next_id   = Arc::new(AtomicU64::new(1));
-        let last_ms   = Arc::new(AtomicU64::new(now_ms()));
+        let next_id      = Arc::new(AtomicU64::new(1));
+        let last_ms      = Arc::new(AtomicU64::new(now_ms()));
+        let disconnected = Arc::new(AtomicBool::new(false));
 
         let client = MediatorClient {
-            conn:            Arc::clone(&conn),
-            pending:         Arc::clone(&pending),
-            write_mu:        Arc::clone(&write_mu),
-            next_id:         Arc::clone(&next_id),
+            conn:             Arc::clone(&conn),
+            pending:          Arc::clone(&pending),
+            write_mu:         Arc::clone(&write_mu),
+            next_id:          Arc::clone(&next_id),
             last_activity_ms: Arc::clone(&last_ms),
             stop_tx:          stop_tx.clone(),
             mediator_pubkey,
+            disconnected:     Arc::clone(&disconnected),
         };
 
-        // Authenticate before spawning tasks (uses request() which needs pending + write_mu).
-        client.authenticate(&sk).await?;
-
-        // Spawn reader task.
+        // Spawn reader task FIRST — authenticate() uses request() which waits on a
+        // oneshot that is only fulfilled by the reader dispatching server responses.
+        // Spawning after auth would cause every auth to time out.
         {
             let c        = client.clone();
             let listener = Arc::clone(&listener);
@@ -102,15 +111,22 @@ impl MediatorClient {
             });
         }
 
-        // Spawn ping task.
+        // Authenticate now that the reader is running to process server responses.
+        if let Err(e) = client.authenticate(&sk).await {
+            client.stop(); // shut down the reader task we just spawned
+            return Err(e);
+        }
+
+        // Spawn ping task (needs listener so it can fire on_disconnected on timeout).
         {
-            let c       = client.clone();
+            let c           = client.clone();
+            let listener    = Arc::clone(&listener);
             let mut stop_rx = stop_tx.subscribe();
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
                     _ = stop_rx.recv() => {},
-                    _ = c.ping_loop() => {},
+                    _ = c.ping_loop(listener.as_ref()) => {},
                 }
             });
         }
@@ -247,7 +263,7 @@ impl MediatorClient {
         write_tlv_i64(&mut p, TAG_MESSAGE_GUID,  guid);
         write_tlv_i64(&mut p, TAG_TIMESTAMP,     timestamp);
         write_tlv(&mut p,     TAG_MESSAGE_BLOB,  data);
-        let resp = self.request(CMD_SEND_MESSAGE, &p).await?;
+        let resp = self.request_timed(CMD_SEND_MESSAGE, &p, SEND_TIMEOUT).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("sendMessage")); }
         let tlvs = parse_tlvs(&resp.payload)?;
         let msg_id  = tlvs.get_i64(TAG_MESSAGE_ID)?;
@@ -379,6 +395,11 @@ impl MediatorClient {
 
     /// Send a command and wait for the matching response (up to `REQ_TIMEOUT`).
     pub(super) async fn request(&self, cmd: u8, payload: &[u8]) -> Result<Response, MimirError> {
+        self.request_timed(cmd, payload, REQ_TIMEOUT).await
+    }
+
+    /// Like `request()` but with a caller-specified timeout.
+    async fn request_timed(&self, cmd: u8, payload: &[u8], timeout_dur: Duration) -> Result<Response, MimirError> {
         // Allocate req_id: u16, skip 0 (reserved for push).
         let raw = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req_id = ((raw % 0xFFFF) as u16) + 1; // range 1..=65535
@@ -395,7 +416,7 @@ impl MediatorClient {
         }
 
         // Await response with timeout.
-        match time::timeout(REQ_TIMEOUT, rx).await {
+        match time::timeout(timeout_dur, rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_))   => {
                 // Sender dropped (connection closed).
@@ -419,7 +440,10 @@ impl MediatorClient {
                 Ok(r)  => r,
                 Err(e) => {
                     log::error!("mediator reader error: {e}");
-                    listener.on_disconnected(self.mediator_pubkey.to_vec());
+                    // Use swap to ensure only one of reader/ping fires on_disconnected.
+                    if !self.disconnected.swap(true, Ordering::SeqCst) {
+                        listener.on_disconnected(self.mediator_pubkey.to_vec());
+                    }
                     return;
                 }
             };
@@ -552,7 +576,7 @@ impl MediatorClient {
 
     // ── Internal: ping loop ────────────────────────────────────────────────────
 
-    async fn ping_loop(&self) {
+    async fn ping_loop(&self, listener: &dyn MediatorEventListener) {
         let mut interval = time::interval(PING_INTERVAL);
         interval.tick().await; // skip the immediate first tick
         loop {
@@ -563,10 +587,21 @@ impl MediatorClient {
             if elapsed >= PING_INTERVAL.as_millis() as u64 {
                 if let Err(e) = self.request(CMD_PING, &[]).await {
                     log::error!("mediator ping failed: {e}");
+                    // Zombie connection detected — notify and stop everything.
+                    if !self.disconnected.swap(true, Ordering::SeqCst) {
+                        listener.on_disconnected(self.mediator_pubkey.to_vec());
+                    }
+                    // Stop the reader task too (it may be blocked on a hung read).
+                    let _ = self.stop_tx.send(());
                     return;
                 }
             }
         }
+    }
+
+    /// Returns `true` if this client has been marked as disconnected.
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
     }
 }
 
