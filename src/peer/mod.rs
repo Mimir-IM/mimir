@@ -100,6 +100,12 @@ impl PeerState {
 
     fn register_peer(&self, key: [u8; 32], tx: mpsc::UnboundedSender<OutgoingCmd>) {
         if let Ok(mut map) = self.peers.lock() {
+            // Tell the old connection it is being replaced so its message_loop
+            // exits cleanly without firing a HANGUP callback.  The Android side
+            // will retry the call (if any) on the new connection via onPeerConnected.
+            if let Some(old_tx) = map.get(&key) {
+                let _ = old_tx.send(OutgoingCmd::Replaced);
+            }
             map.insert(key, tx);
         }
     }

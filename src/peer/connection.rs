@@ -34,8 +34,9 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 const CALL_PING_INTERVAL: Duration = Duration::from_millis(2000);
 const PING_TIMEOUT: Duration = Duration::from_secs(7);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
-const CALL_IDLE_TIMEOUT: Duration = Duration::from_millis(3500);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);      // 10 min — no call in progress
+const CALL_IDLE_TIMEOUT: Duration = Duration::from_millis(3500); // InCall only: audio must flow
+const CALL_WAIT_TIMEOUT: Duration = Duration::from_secs(60);  // Calling/Receiving: wait for answer
 
 // ── Commands sent from PeerNode into a connection task ────────────────────────
 
@@ -53,6 +54,10 @@ pub enum OutgoingCmd {
     HangupCall,
     CallPacket(Vec<u8>),
     Disconnect,
+    /// Sent by register_peer when a newer connection replaces this one.
+    /// Causes the loop to exit cleanly WITHOUT firing the HANGUP callback,
+    /// so the Android side can retry the call on the new connection.
+    Replaced,
 }
 
 // ── Shared state passed into connection tasks ─────────────────────────────────
@@ -267,14 +272,24 @@ async fn message_loop(conn: Arc<AsyncConn>, peer_key: [u8; 32], mut cmd_rx: mpsc
     let mut dead_peer = false;
 
     'main: loop {
-        // Dynamic ping interval based on call state
+        // Dynamic ping interval and idle timeout based on call state.
+        //
+        // InCall:           3.5 s  — audio packets must flow (last_pong OR last_activity)
+        // Calling/Receiving: 60 s  — waiting for answer; only pong counts (no audio yet)
+        // No call:          10 min — normal keep-alive via last_activity
+        //
+        // Note: PING_TIMEOUT (7 s after unanswered ping) catches truly dead connections
+        // well before CALL_WAIT_TIMEOUT fires, so 60 s is just a safety net.
         let is_in_call = matches!(call_status, CallStatus::Calling | CallStatus::InCall | CallStatus::Receiving);
-        let idle_timeout = if is_in_call { CALL_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
+        let (idle_timeout, last_act) = match call_status {
+            CallStatus::InCall => (CALL_IDLE_TIMEOUT, last_pong.max(last_activity)),
+            CallStatus::Calling | CallStatus::Receiving => (CALL_WAIT_TIMEOUT, last_pong),
+            _ => (IDLE_TIMEOUT, last_activity),
+        };
         let ping_deadline = if is_in_call { CALL_PING_INTERVAL } else { PING_INTERVAL };
 
         // Check timeouts before blocking
         let now = Instant::now();
-        let last_act = if is_in_call { last_pong.max(last_activity) } else { last_activity };
         if now.duration_since(last_act) >= idle_timeout {
             log::info!("Peer {} idle timeout", &address);
             dead_peer = true;
@@ -321,10 +336,17 @@ async fn message_loop(conn: Arc<AsyncConn>, peer_key: [u8; 32], mut cmd_rx: mpsc
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(OutgoingCmd::Disconnect) | None => break 'main,
+                    Some(OutgoingCmd::Replaced) => {
+                        // A newer connection to this peer has taken over.
+                        // Exit cleanly without firing HANGUP so the Android side
+                        // can retry the call on the new connection.
+                        call_status = CallStatus::Idle;
+                        break 'main;
+                    }
                     Some(c) => {
                         if let Err(e) = handle_outgoing(
                             c, &write_tx, &mut call_status,
-                            &ctx, &peer_key,
+                            &ctx, &peer_key, &mut last_pong,
                         ).await {
                             log::error!("Error sending to {}: {}", &address, e);
                             break 'main;
@@ -423,6 +445,8 @@ async fn handle_incoming(
         IncomingFrame::CallOffer(_offer) => {
             if matches!(*call_status, CallStatus::Idle) {
                 *call_status = CallStatus::Receiving;
+                // Reset so CALL_IDLE_TIMEOUT counts from when the call arrives.
+                *last_pong = Instant::now();
                 ctx.event_cb.on_incoming_call(peer_key.to_vec());
             }
         }
@@ -463,6 +487,7 @@ async fn handle_outgoing(
     call_status: &mut CallStatus,
     ctx: &ConnContext,
     peer_key: &[u8; 32],
+    last_pong: &mut Instant,
 ) -> Result<(), MimirError> {
     match cmd {
         OutgoingCmd::Message { guid, reply_to, send_time, edit_time, msg_type, data } => {
@@ -483,6 +508,9 @@ async fn handle_outgoing(
                 write_tx.send(bytes)
                     .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
                 *call_status = CallStatus::Calling;
+                // Reset so CALL_IDLE_TIMEOUT counts from when the call is initiated,
+                // not from whenever the last pong happened to arrive.
+                *last_pong = Instant::now();
                 ctx.event_cb.on_call_status_changed(CallStatus::Calling, Some(peer_key.to_vec()));
             }
         }
@@ -494,6 +522,8 @@ async fn handle_outgoing(
                     .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
                 if accept {
                     *call_status = CallStatus::InCall;
+                    // Reset so CALL_IDLE_TIMEOUT counts from call acceptance.
+                    *last_pong = Instant::now();
                     ctx.event_cb.on_call_status_changed(CallStatus::InCall, Some(peer_key.to_vec()));
                 } else {
                     *call_status = CallStatus::Idle;
@@ -516,7 +546,10 @@ async fn handle_outgoing(
                 .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
         }
 
-        OutgoingCmd::Disconnect => {}
+        OutgoingCmd::Disconnect | OutgoingCmd::Replaced => {
+            // These are handled in the message_loop cmd branch before calling
+            // handle_outgoing; they should never reach here.
+        }
     }
     Ok(())
 }
