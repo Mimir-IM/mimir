@@ -77,7 +77,7 @@ pub struct Resolver {
     trackers:   Vec<TrackerEntry>,
     /// permanent_pubkey → list of unexpired ephemeral addresses
     cache:      Mutex<HashMap<[u8; 32], Vec<CachedPeer>>>,
-    /// Serialises send+receive operations so concurrent resolver requests don't
+    /// Serializes send+receive operations so concurrent resolver requests don't
     /// steal each other's datagram responses.
     recv_lock:  tokio::sync::Mutex<()>,
 }
@@ -89,12 +89,7 @@ impl Resolver {
     ///                     used for peer stream connections is fine; streams and
     ///                     datagrams are demultiplexed at the ygg_stream layer).
     /// * `tracker_strs`  – Tracker addresses in `"<hex32_pubkey>:<port>"` format.
-    pub fn new(
-        node:         Arc<AsyncNode>,
-        signing_key:  Arc<SigningKey>,
-        listen_port:  u16,
-        tracker_strs: &[String],
-    ) -> Self {
+    pub fn new(node: Arc<AsyncNode>, signing_key: Arc<SigningKey>, listen_port: u16, tracker_strs: &[String]) -> Self {
         let our_pubkey = pubkey_of(&signing_key);
         let trackers   = tracker_strs.iter().filter_map(|s| parse_tracker(s)).collect();
         Resolver {
@@ -234,11 +229,7 @@ impl Resolver {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    async fn get_addrs_from(
-        &self,
-        tracker: &TrackerEntry,
-        permanent_pubkey: &[u8; 32],
-    ) -> Result<Vec<CachedPeer>, String> {
+    async fn get_addrs_from(&self, tracker: &TrackerEntry, permanent_pubkey: &[u8; 32]) -> Result<Vec<CachedPeer>, String> {
         let nonce = random_nonce();
 
         // GET_ADDRS request: [VERSION:1][nonce:4][CMD_GET_ADDRS:1][permanent_pubkey:32]
@@ -255,22 +246,14 @@ impl Resolver {
 
         let payload = self.recv_matching(&tracker.pubkey, &nonce, CMD_GET_ADDRS).await?;
         let rtt_ms = t0.elapsed().as_millis() as u64;
-        log::debug!(
-            "resolver: tracker {} RTT = {rtt_ms}ms",
-            hex::encode(&tracker.pubkey[..4])
-        );
+        log::debug!("resolver: tracker {} RTT = {rtt_ms}ms", hex::encode(&tracker.pubkey[..4]));
 
         parse_get_addrs_response(&payload, permanent_pubkey)
     }
 
     /// Wait for a datagram from `expected_sender` whose payload starts with
     /// `[nonce:4][cmd:1]`.  Returns the payload after those 5 bytes.
-    async fn recv_matching(
-        &self,
-        expected_sender: &[u8; 32],
-        nonce: &[u8; 4],
-        cmd: u8,
-    ) -> Result<Vec<u8>, String> {
+    async fn recv_matching(&self, expected_sender: &[u8; 32], nonce: &[u8; 4], cmd: u8) -> Result<Vec<u8>, String> {
         for _ in 0..MAX_RECV_LOOPS {
             let (data, sender) = self.node
                 .recv_datagram_with_timeout(self.listen_port, RECV_TIMEOUT_MS)
@@ -301,10 +284,7 @@ impl Resolver {
 ///
 /// Each peer record is signature-verified against `permanent_pubkey`.
 /// Invalid records are silently skipped.
-fn parse_get_addrs_response(
-    payload:         &[u8],
-    permanent_pubkey: &[u8; 32],
-) -> Result<Vec<CachedPeer>, String> {
+fn parse_get_addrs_response(payload: &[u8], permanent_pubkey: &[u8; 32]) -> Result<Vec<CachedPeer>, String> {
     if payload.is_empty() {
         return Ok(vec![]);
     }
@@ -325,17 +305,18 @@ fn parse_get_addrs_response(
 
     for _ in 0..count {
         let eph_key:   [u8; 32] = payload[off..off+32].try_into().unwrap(); off += 32;
-        let sig                  = &payload[off..off+64];                    off += 64;
-        let priority             = payload[off];                             off += 1;
-        let client_id            = u32::from_be_bytes(payload[off..off+4].try_into().unwrap()); off += 4;
-        let ttl_secs             = u64::from_be_bytes(payload[off..off+8].try_into().unwrap()); off += 8;
+        let sig = &payload[off..off + 64];
+        off += 64;
+        let priority = payload[off];
+        off += 1;
+        let client_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
+        off += 4;
+        let ttl_secs = u64::from_be_bytes(payload[off..off + 8].try_into().unwrap());
+        off += 8;
 
         // Verify: sign(permanent_sk, eph_key) must match.
         if verify(permanent_pubkey, &eph_key, sig).is_err() {
-            log::warn!(
-                "resolver: bad signature for peer eph={}",
-                hex::encode(&eph_key[..4])
-            );
+            log::warn!("resolver: bad signature for peer eph={}", hex::encode(&eph_key[..4]));
             continue;
         }
 
@@ -390,7 +371,7 @@ mod tests {
     ) -> Vec<u8> {
         let mut payload = vec![peers.len() as u8];
         for (eph_key, priority, client_id, ttl) in peers {
-            let sig = crate::crypto::sign(permanent_sk, eph_key.as_slice());
+            let sig = sign(permanent_sk, eph_key.as_slice());
             payload.extend_from_slice(eph_key);
             payload.extend_from_slice(&sig);
             payload.push(*priority);
@@ -405,7 +386,7 @@ mod tests {
         let sk   = random_sk();
         let seed = sk.to_bytes();
         let node = Arc::new(
-            ygg_stream::AsyncNode::new_with_key(&seed, vec![])
+            AsyncNode::new_with_key(&seed, vec![])
                 .await
                 .expect("AsyncNode::new_with_key failed"),
         );
@@ -469,7 +450,7 @@ mod tests {
     #[test]
     fn parse_get_addrs_valid_single_record() {
         let sk            = random_sk();
-        let permanent_pk  = crate::crypto::pubkey_of(&sk);
+        let permanent_pk  = pubkey_of(&sk);
         let eph_key       = [7u8; 32];
         let payload = build_get_addrs_payload(&sk, &[(eph_key, 5, 42, 300)]);
 
@@ -485,7 +466,7 @@ mod tests {
     #[test]
     fn parse_get_addrs_multiple_records() {
         let sk           = random_sk();
-        let permanent_pk = crate::crypto::pubkey_of(&sk);
+        let permanent_pk = pubkey_of(&sk);
         let peers_in = [
             ([1u8; 32], 10u8, 1u32, 600u64),
             ([2u8; 32], 5,    2,    300),
@@ -500,7 +481,7 @@ mod tests {
     fn parse_get_addrs_bad_signature_is_skipped() {
         let sk            = random_sk();
         let attacker_sk   = random_sk();
-        let permanent_pk  = crate::crypto::pubkey_of(&sk);
+        let permanent_pk  = pubkey_of(&sk);
         let eph_key       = [0xABu8; 32];
 
         // Signed by the wrong key — should fail verification and be skipped.

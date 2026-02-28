@@ -25,8 +25,8 @@ use manager::MediatorManager;
 ///
 /// All methods are thread-safe and can be called from any thread.
 pub struct MediatorNode {
-    rt:      Arc<tokio::runtime::Runtime>,
-    sk:      Arc<ed25519_dalek::SigningKey>,
+    rt: Arc<tokio::runtime::Runtime>,
+    sk: Arc<ed25519_dalek::SigningKey>,
     manager: Arc<MediatorManager>,
 }
 
@@ -36,14 +36,10 @@ impl MediatorNode {
     /// * `peer_node`        – A running `PeerNode`; its Ygg node and runtime are reused.
     /// * `mediator_port`    – The TCP-level port number the mediator listens on.
     /// * `event_listener`   – Receives all mediator events (messages, invites, etc.).
-    pub fn new(
-        peer_node:       Arc<PeerNode>,
-        mediator_port:   u16,
-        event_listener:  Box<dyn MediatorEventListener>,
-    ) -> Result<Self, MimirError> {
+    pub fn new(peer_node: Arc<PeerNode>, mediator_port: u16, event_listener: Box<dyn MediatorEventListener>) -> Result<Self, MimirError> {
         let ygg_node = peer_node.ygg_node();
-        let rt       = peer_node.runtime();
-        let sk       = peer_node.signing_key();
+        let rt = peer_node.runtime();
+        let sk = peer_node.signing_key();
 
         let listener: Arc<dyn MediatorEventListener> = Arc::from(event_listener);
         let manager = Arc::new(MediatorManager::new(
@@ -83,15 +79,9 @@ impl MediatorNode {
 
     /// Create a new group chat.  Includes proof-of-work (~1–5 seconds CPU).
     /// Returns the new chat ID assigned by the mediator.
-    pub fn create_chat(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        name:            String,
-        description:     String,
-        avatar:          Option<Vec<u8>>,
-    ) -> Result<u64, MimirError> {
+    pub fn create_chat(&self, mediator_pubkey: Vec<u8>, name: String, description: String, avatar: Option<Vec<u8>>) -> Result<i64, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
-        let sk  = Arc::clone(&self.sk);
+        let sk = Arc::clone(&self.sk);
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
             client.create_chat(
@@ -103,7 +93,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn delete_chat(&self, mediator_pubkey: Vec<u8>, chat_id: u64) -> Result<(), MimirError> {
+    pub fn delete_chat(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -111,14 +101,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn update_chat_info(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        name:            Option<String>,
-        description:     Option<String>,
-        avatar:          Option<Vec<u8>>,
-    ) -> Result<(), MimirError> {
+    pub fn update_chat_info(&self, mediator_pubkey: Vec<u8>, chat_id: i64, name: Option<String>, description: Option<String>, avatar: Option<Vec<u8>>) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -133,12 +116,7 @@ impl MediatorNode {
 
     // ── Membership ────────────────────────────────────────────────────────────
 
-    pub fn add_user(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        user_pubkey:     Vec<u8>,
-    ) -> Result<(), MimirError> {
+    pub fn add_user(&self, mediator_pubkey: Vec<u8>, chat_id: i64, user_pubkey: Vec<u8>) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -146,12 +124,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn delete_user(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        user_pubkey:     Vec<u8>,
-    ) -> Result<(), MimirError> {
+    pub fn delete_user(&self, mediator_pubkey: Vec<u8>, chat_id: i64, user_pubkey: Vec<u8>) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -159,11 +132,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn leave_chat(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-    ) -> Result<(), MimirError> {
+    pub fn leave_chat(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -171,13 +140,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn change_member_status(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        user_pubkey:     Vec<u8>,
-        new_permissions: u8,
-    ) -> Result<(), MimirError> {
+    pub fn change_member_status(&self, mediator_pubkey: Vec<u8>, chat_id: i64, user_pubkey: Vec<u8>, new_permissions: u8) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -189,11 +152,7 @@ impl MediatorNode {
 
     /// Subscribe to push messages for `chat_id`.
     /// Returns the server's last message ID (use to fetch missed messages).
-    pub fn subscribe(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-    ) -> Result<u64, MimirError> {
+    pub fn subscribe(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<i64, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -202,14 +161,7 @@ impl MediatorNode {
     }
 
     /// Send an encrypted message blob.  Returns the server-assigned message ID.
-    pub fn send_group_message(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        guid:            u64,
-        timestamp:       u64,
-        data:            Vec<u8>,
-    ) -> Result<u64, MimirError> {
+    pub fn send_group_message(&self, mediator_pubkey: Vec<u8>, chat_id: i64, guid: i64, timestamp: i64, data: Vec<u8>) -> Result<i64, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -218,12 +170,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn delete_message(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        message_id:      u64,
-    ) -> Result<(), MimirError> {
+    pub fn delete_message(&self, mediator_pubkey: Vec<u8>, chat_id: i64, message_id: i64) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -231,11 +178,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn get_last_message_id(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-    ) -> Result<u64, MimirError> {
+    pub fn get_last_message_id(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<i64, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -243,13 +186,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn get_messages_since(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        since_id:        u64,
-        limit:           u32,
-    ) -> Result<Vec<GroupMessage>, MimirError> {
+    pub fn get_messages_since(&self, mediator_pubkey: Vec<u8>, chat_id: i64, since_id: i64, limit: u32) -> Result<Vec<GroupMessage>, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -259,13 +196,7 @@ impl MediatorNode {
 
     // ── Invites ───────────────────────────────────────────────────────────────
 
-    pub fn send_invite(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        recipient_pubkey:Vec<u8>,
-        encrypted_data:  Vec<u8>,
-    ) -> Result<(), MimirError> {
+    pub fn send_invite(&self, mediator_pubkey: Vec<u8>, chat_id: i64, recipient_pubkey: Vec<u8>, encrypted_data: Vec<u8>) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -273,13 +204,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn respond_to_invite(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        invite_id:       u64,
-        accept:          bool,
-    ) -> Result<(), MimirError> {
+    pub fn respond_to_invite(&self, mediator_pubkey: Vec<u8>, chat_id: i64, invite_id: i64, accept: bool) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -290,13 +215,7 @@ impl MediatorNode {
     // ── Member info ───────────────────────────────────────────────────────────
 
     /// Push our encrypted profile blob to the mediator for `chat_id`.
-    pub fn update_member_info(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-        encrypted_blob:  Vec<u8>,
-        timestamp:       u64,
-    ) -> Result<(), MimirError> {
+    pub fn update_member_info(&self, mediator_pubkey: Vec<u8>, chat_id: i64, encrypted_blob: Vec<u8>, timestamp: i64) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -304,12 +223,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn get_members_info(
-        &self,
-        mediator_pubkey:  Vec<u8>,
-        chat_id:          u64,
-        since_timestamp:  u64,
-    ) -> Result<Vec<GroupMemberInfo>, MimirError> {
+    pub fn get_members_info(&self, mediator_pubkey: Vec<u8>, chat_id: i64, since_timestamp: i64) -> Result<Vec<GroupMemberInfo>, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
@@ -317,11 +231,7 @@ impl MediatorNode {
         })
     }
 
-    pub fn get_members(
-        &self,
-        mediator_pubkey: Vec<u8>,
-        chat_id:         u64,
-    ) -> Result<Vec<GroupMember>, MimirError> {
+    pub fn get_members(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<Vec<GroupMember>, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;

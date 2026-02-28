@@ -26,28 +26,27 @@ use ygg_stream::AsyncConn;
 use crate::{
     CallStatus, ContactInfo, InfoProvider, MimirError, PeerEventListener,
 };
-use super::protocol as proto;
 use super::protocol::*;
 
 // ── Timeouts / intervals ──────────────────────────────────────────────────────
 
-const AUTH_TIMEOUT: Duration      = Duration::from_secs(10);
-const PING_INTERVAL: Duration     = Duration::from_secs(60);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const PING_INTERVAL: Duration = Duration::from_secs(60);
 const CALL_PING_INTERVAL: Duration = Duration::from_millis(2000);
-const PING_TIMEOUT: Duration      = Duration::from_secs(7);
-const IDLE_TIMEOUT: Duration      = Duration::from_secs(600); // 10 min
+const PING_TIMEOUT: Duration = Duration::from_secs(7);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 const CALL_IDLE_TIMEOUT: Duration = Duration::from_millis(3500);
 
 // ── Commands sent from PeerNode into a connection task ────────────────────────
 
 pub enum OutgoingCmd {
     Message {
-        guid:      u64,
-        reply_to:  u64,
-        send_time: u64,
-        edit_time: u64,
-        msg_type:  i32,
-        data:      Vec<u8>,
+        guid: i64,
+        reply_to: i64,
+        send_time: i64,
+        edit_time: i64,
+        msg_type: i32,
+        data: Vec<u8>,
     },
     StartCall,
     AnswerCall(bool),
@@ -60,25 +59,22 @@ pub enum OutgoingCmd {
 
 pub struct ConnContext {
     pub signing_key: Arc<SigningKey>,
-    pub our_pubkey:  [u8; 32],
-    pub client_id:   i32,
-    pub event_cb:    Arc<dyn PeerEventListener>,
-    pub info_cb:     Arc<dyn InfoProvider>,
+    pub our_pubkey: [u8; 32],
+    pub client_id: i32,
+    pub event_cb: Arc<dyn PeerEventListener>,
+    pub info_cb: Arc<dyn InfoProvider>,
 }
 
 // ── Entry points ──────────────────────────────────────────────────────────────
 
 /// Drive an **inbound** connection to completion.
 /// Returns the peer's pubkey and an outgoing-command sender on success.
-pub async fn run_inbound(
-    conn: Arc<AsyncConn>,
-    ctx: Arc<ConnContext>,
-) -> Option<([u8; 32], mpsc::UnboundedSender<OutgoingCmd>)> {
+pub async fn run_inbound(conn: Arc<AsyncConn>, ctx: Arc<ConnContext>) -> Option<([u8; 32], mpsc::UnboundedSender<OutgoingCmd>)> {
     let auth_result = tokio::time::timeout(
         AUTH_TIMEOUT,
         auth_inbound(&conn, &ctx),
     )
-    .await;
+        .await;
 
     match auth_result {
         Ok(Ok(peer_key)) => {
@@ -99,16 +95,12 @@ pub async fn run_inbound(
 
 /// Drive an **outbound** connection to completion.
 /// Returns the outgoing-command sender on success.
-pub async fn run_outbound(
-    conn: Arc<AsyncConn>,
-    peer_key: [u8; 32],
-    ctx: Arc<ConnContext>,
-) -> Option<mpsc::UnboundedSender<OutgoingCmd>> {
+pub async fn run_outbound(conn: Arc<AsyncConn>, peer_key: [u8; 32], ctx: Arc<ConnContext>) -> Option<mpsc::UnboundedSender<OutgoingCmd>> {
     let auth_result = tokio::time::timeout(
         AUTH_TIMEOUT,
         auth_outbound(&conn, &ctx, &peer_key),
     )
-    .await;
+        .await;
 
     match auth_result {
         Ok(Ok(())) => {
@@ -134,10 +126,7 @@ pub async fn run_outbound(
 /// Flow (inbound perspective):
 ///   recv Hello  → send Challenge  → recv ChallengeAnswer → verify → send OK
 ///   recv Challenge2 → sign → send ChallengeAnswer2 → recv OK
-async fn auth_inbound(
-    conn: &AsyncConn,
-    ctx: &ConnContext,
-) -> Result<[u8; 32], MimirError> {
+async fn auth_inbound(conn: &AsyncConn, ctx: &ConnContext) -> Result<[u8; 32], MimirError> {
     // Step 1: receive Hello
     let header = read_header(conn).await?;
     if header.msg_type != MSG_TYPE_HELLO {
@@ -198,11 +187,7 @@ async fn auth_inbound(
 /// Flow (outbound perspective):
 ///   send Hello → recv Challenge → sign → send ChallengeAnswer → recv OK
 ///   send Challenge2 → recv ChallengeAnswer2 → verify → send OK
-async fn auth_outbound(
-    conn: &AsyncConn,
-    ctx: &ConnContext,
-    peer_key: &[u8; 32],
-) -> Result<(), MimirError> {
+async fn auth_outbound(conn: &AsyncConn, ctx: &ConnContext, peer_key: &[u8; 32]) -> Result<(), MimirError> {
     // Step 1: send Hello
     write_hello(conn, &ctx.our_pubkey, peer_key, ctx.client_id).await?;
 
@@ -252,24 +237,19 @@ async fn auth_outbound(
 
 /// Post-auth message loop.  Runs until the connection dies or is explicitly
 /// closed.
-async fn message_loop(
-    conn: Arc<AsyncConn>,
-    peer_key: [u8; 32],
-    mut cmd_rx: mpsc::UnboundedReceiver<OutgoingCmd>,
-    ctx: Arc<ConnContext>,
-) {
+async fn message_loop(conn: Arc<AsyncConn>, peer_key: [u8; 32], mut cmd_rx: mpsc::UnboundedReceiver<OutgoingCmd>, ctx: Arc<ConnContext>) {
     let address = hex::encode(peer_key);
     ctx.event_cb.on_peer_connected(peer_key.to_vec(), address.clone());
 
     // Request peer's contact info once, right after auth.
     let since = ctx.info_cb.get_contact_update_time(peer_key.to_vec());
-    let _ = proto::write_info_request(&conn, since as i64).await;
+    let _ = write_info_request(&conn, since as i64).await;
 
     // The reader sub-task owns a clone of conn for reading.
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<IncomingFrame>();
-    let (write_tx, write_rx)     = mpsc::unbounded_channel::<Vec<u8>>();
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let read_conn  = Arc::clone(&conn);
+    let read_conn = Arc::clone(&conn);
     let write_conn = Arc::clone(&conn);
 
     tokio::spawn(reader_task(read_conn, frame_tx));
@@ -289,8 +269,8 @@ async fn message_loop(
     'main: loop {
         // Dynamic ping interval based on call state
         let is_in_call = matches!(call_status, CallStatus::Calling | CallStatus::InCall | CallStatus::Receiving);
-        let idle_timeout   = if is_in_call { CALL_IDLE_TIMEOUT   } else { IDLE_TIMEOUT };
-        let ping_deadline  = if is_in_call { CALL_PING_INTERVAL  } else { PING_INTERVAL };
+        let idle_timeout = if is_in_call { CALL_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
+        let ping_deadline = if is_in_call { CALL_PING_INTERVAL } else { PING_INTERVAL };
 
         // Check timeouts before blocking
         let now = Instant::now();
@@ -375,12 +355,12 @@ async fn message_loop(
 
 /// Dispatch a fully-parsed incoming frame.
 async fn handle_incoming(
-    frame:       IncomingFrame,
-    peer_key:    &[u8; 32],
-    ctx:         &ConnContext,
-    write_tx:    &mpsc::UnboundedSender<Vec<u8>>,
+    frame: IncomingFrame,
+    peer_key: &[u8; 32],
+    ctx: &ConnContext,
+    write_tx: &mpsc::UnboundedSender<Vec<u8>>,
     call_status: &mut CallStatus,
-    last_pong:   &mut Instant,
+    last_pong: &mut Instant,
 ) -> Result<(), MimirError> {
     match frame {
         IncomingFrame::Ping => {
@@ -394,7 +374,7 @@ async fn handle_incoming(
 
         IncomingFrame::Message(msg) => {
             // Acknowledge receipt.
-            let ok = build_ok_frame(msg.guid as i64);
+            let ok = build_ok_frame(msg.guid);
             write_tx.send(ok)
                 .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
 
@@ -411,18 +391,18 @@ async fn handle_incoming(
 
         IncomingFrame::Ok(id) => {
             if id != 0 {
-                ctx.event_cb.on_message_delivered(peer_key.to_vec(), id as u64);
+                ctx.event_cb.on_message_delivered(peer_key.to_vec(), id);
             }
         }
 
         IncomingFrame::InfoRequest(since) => {
-            let info = ctx.info_cb.get_my_info(since as u64);
+            let info = ctx.info_cb.get_my_info(since);
             if let Some(i) = info {
                 let resp = InfoResponse {
-                    time:     i.update_time as i64,
+                    time: i.update_time as i64,
                     nickname: i.nickname,
-                    info:     i.info,
-                    avatar:   i.avatar,
+                    info: i.info,
+                    avatar: i.avatar,
                 };
                 // Serialize and queue the write.
                 let bytes = encode_info_response(&resp)?;
@@ -433,10 +413,10 @@ async fn handle_incoming(
 
         IncomingFrame::InfoResponse(r) => {
             ctx.info_cb.update_contact_info(peer_key.to_vec(), ContactInfo {
-                nickname:    r.nickname,
-                info:        r.info,
-                avatar:      r.avatar,
-                update_time: r.time as u64,
+                nickname: r.nickname,
+                info: r.info,
+                avatar: r.avatar,
+                update_time: r.time,
             });
         }
 
@@ -478,11 +458,11 @@ async fn handle_incoming(
 // ── Outgoing command handling ─────────────────────────────────────────────────
 
 async fn handle_outgoing(
-    cmd:         OutgoingCmd,
-    write_tx:    &mpsc::UnboundedSender<Vec<u8>>,
+    cmd: OutgoingCmd,
+    write_tx: &mpsc::UnboundedSender<Vec<u8>>,
     call_status: &mut CallStatus,
-    ctx:         &ConnContext,
-    peer_key:    &[u8; 32],
+    ctx: &ConnContext,
+    peer_key: &[u8; 32],
 ) -> Result<(), MimirError> {
     match cmd {
         OutgoingCmd::Message { guid, reply_to, send_time, edit_time, msg_type, data } => {
@@ -495,8 +475,8 @@ async fn handle_outgoing(
         OutgoingCmd::StartCall => {
             if matches!(*call_status, CallStatus::Idle) {
                 let offer = CallOffer {
-                    mime_type:     "audio/aac".to_string(),
-                    sample_rate:   44100,
+                    mime_type: "audio/aac".to_string(),
+                    sample_rate: 44100,
                     channel_count: 1,
                 };
                 let bytes = encode_call_offer(&offer)?;
@@ -564,11 +544,11 @@ pub enum IncomingFrame {
 /// connection closes or the receiver is dropped.
 async fn reader_task(
     conn: Arc<AsyncConn>,
-    tx:   mpsc::UnboundedSender<IncomingFrame>,
+    tx: mpsc::UnboundedSender<IncomingFrame>,
 ) {
     loop {
         let frame = match read_one_frame(&conn).await {
-            Ok(f)  => f,
+            Ok(f) => f,
             Err(e) => {
                 log::info!("Reader task: connection closed ({})", e);
                 break;
@@ -627,7 +607,7 @@ async fn read_one_frame(conn: &AsyncConn) -> Result<IncomingFrame, MimirError> {
         other => {
             // Unknown type: discard the declared payload bytes.
             if header.size > 0 {
-                proto::discard(conn, header.size as usize).await?;
+                discard(conn, header.size as usize).await?;
             }
             IncomingFrame::Unknown(other, header.size)
         }
@@ -640,10 +620,7 @@ async fn read_one_frame(conn: &AsyncConn) -> Result<IncomingFrame, MimirError> {
 /// Runs in its own tokio task.  Drains the write channel and sends each
 /// pre-serialized frame to the connection.  Exits when the channel closes
 /// or a write fails.
-async fn writer_task(
-    conn: Arc<AsyncConn>,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+async fn writer_task(conn: Arc<AsyncConn>, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(bytes) = rx.recv().await {
         if let Err(e) = conn.write(&bytes).await {
             log::info!("Writer task: write failed ({})", e);
@@ -655,28 +632,28 @@ async fn writer_task(
 // ── Pre-serialisation helpers (avoid async for encode-only paths) ─────────────
 
 fn build_ping_frame() -> Vec<u8> {
-    proto::build_header(MSG_TYPE_PING, 0).to_vec()
+    build_header(MSG_TYPE_PING, 0).to_vec()
 }
 
 fn build_pong_frame() -> Vec<u8> {
-    proto::build_header(MSG_TYPE_PONG, 0).to_vec()
+    build_header(MSG_TYPE_PONG, 0).to_vec()
 }
 
 fn build_ok_frame(id: i64) -> Vec<u8> {
     let mut buf = vec![0u8; 24];
-    buf[..16].copy_from_slice(&proto::build_header(MSG_TYPE_OK, 8));
+    buf[..16].copy_from_slice(&build_header(MSG_TYPE_OK, 8));
     buf[16..].copy_from_slice(&id.to_be_bytes());
     buf
 }
 
 fn encode_info_response(r: &InfoResponse) -> Result<Vec<u8>, MimirError> {
     let nick = r.nickname.as_bytes();
-    let inf  = r.info.as_bytes();
-    let av   = r.avatar.as_deref().unwrap_or(&[]);
+    let inf = r.info.as_bytes();
+    let av = r.avatar.as_deref().unwrap_or(&[]);
     let payload_len = 8 + 4 + nick.len() + 4 + inf.len() + 4 + av.len();
 
     let mut buf = Vec::with_capacity(16 + payload_len);
-    buf.extend_from_slice(&proto::build_header(MSG_TYPE_INFO_RESPONSE, payload_len as i64));
+    buf.extend_from_slice(&build_header(MSG_TYPE_INFO_RESPONSE, payload_len as i64));
     buf.extend_from_slice(&r.time.to_be_bytes());
     buf.extend_from_slice(&(nick.len() as i32).to_be_bytes());
     buf.extend_from_slice(nick);
@@ -693,15 +670,15 @@ fn encode_message(msg: &P2pMessage) -> Result<Vec<u8>, MimirError> {
         "sendTime": msg.send_time,
         "type":     msg.msg_type,
     });
-    if msg.reply_to  != 0 { json["replyTo"]  = serde_json::json!(msg.reply_to);  }
+    if msg.reply_to != 0 { json["replyTo"] = serde_json::json!(msg.reply_to); }
     if msg.edit_time != 0 { json["editTime"] = serde_json::json!(msg.edit_time); }
     if !msg.data.is_empty() { json["payloadSize"] = serde_json::json!(msg.data.len()); }
 
-    let json_bytes  = json.to_string().into_bytes();
+    let json_bytes = json.to_string().into_bytes();
     let payload_len = 4 + json_bytes.len() + msg.data.len();
 
     let mut buf = Vec::with_capacity(16 + payload_len);
-    buf.extend_from_slice(&proto::build_header(MSG_TYPE_MESSAGE_TEXT, payload_len as i64));
+    buf.extend_from_slice(&build_header(MSG_TYPE_MESSAGE_TEXT, payload_len as i64));
     buf.extend_from_slice(&(json_bytes.len() as i32).to_be_bytes());
     buf.extend_from_slice(&json_bytes);
     buf.extend_from_slice(&msg.data);
@@ -712,7 +689,7 @@ fn encode_call_offer(offer: &CallOffer) -> Result<Vec<u8>, MimirError> {
     let mime = offer.mime_type.as_bytes();
     let payload_len = 4 + mime.len() + 4 + 4;
     let mut buf = Vec::with_capacity(16 + payload_len);
-    buf.extend_from_slice(&proto::build_header(MSG_TYPE_CALL_OFFER, payload_len as i64));
+    buf.extend_from_slice(&build_header(MSG_TYPE_CALL_OFFER, payload_len as i64));
     buf.extend_from_slice(&(mime.len() as i32).to_be_bytes());
     buf.extend_from_slice(mime);
     buf.extend_from_slice(&offer.sample_rate.to_be_bytes());
@@ -724,7 +701,7 @@ fn encode_call_answer(ok: bool, error: &str) -> Result<Vec<u8>, MimirError> {
     let err_bytes = error.as_bytes();
     let payload_len = 1 + 4 + err_bytes.len();
     let mut buf = Vec::with_capacity(16 + payload_len);
-    buf.extend_from_slice(&proto::build_header(MSG_TYPE_CALL_ANSWER, payload_len as i64));
+    buf.extend_from_slice(&build_header(MSG_TYPE_CALL_ANSWER, payload_len as i64));
     buf.push(if ok { 1 } else { 0 });
     buf.extend_from_slice(&(err_bytes.len() as i32).to_be_bytes());
     buf.extend_from_slice(err_bytes);
@@ -732,13 +709,13 @@ fn encode_call_answer(ok: bool, error: &str) -> Result<Vec<u8>, MimirError> {
 }
 
 fn encode_call_hangup() -> Result<Vec<u8>, MimirError> {
-    Ok(proto::build_header(MSG_TYPE_CALL_HANG, 0).to_vec())
+    Ok(build_header(MSG_TYPE_CALL_HANG, 0).to_vec())
 }
 
 fn encode_call_packet(data: &[u8]) -> Result<Vec<u8>, MimirError> {
     let payload_len = 4 + data.len();
     let mut buf = Vec::with_capacity(16 + payload_len);
-    buf.extend_from_slice(&proto::build_header(MSG_TYPE_CALL_PACKET, payload_len as i64));
+    buf.extend_from_slice(&build_header(MSG_TYPE_CALL_PACKET, payload_len as i64));
     buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
     buf.extend_from_slice(data);
     Ok(buf)

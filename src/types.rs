@@ -19,7 +19,7 @@ pub struct ContactInfo {
     pub nickname:    String,
     pub info:        String,
     pub avatar:      Option<Vec<u8>>,
-    pub update_time: u64,
+    pub update_time: i64,
 }
 
 // ── Mediator types ────────────────────────────────────────────────────────────
@@ -27,9 +27,9 @@ pub struct ContactInfo {
 /// A group chat message returned by `get_messages_since`.
 #[derive(Debug, Clone)]
 pub struct GroupMessage {
-    pub message_id: u64,
-    pub guid:       u64,
-    pub timestamp:  u64,
+    pub message_id: i64,
+    pub guid:       i64,
+    pub timestamp:  i64,
     pub author:     Vec<u8>,
     pub data:       Vec<u8>,
 }
@@ -40,7 +40,7 @@ pub struct GroupMember {
     pub pubkey:      Vec<u8>,
     pub permissions: u32,
     pub online:      bool,
-    pub last_seen:   u64,
+    pub last_seen:   i64,
 }
 
 /// Member entry returned by `get_members_info` (includes encrypted profile blob).
@@ -48,7 +48,7 @@ pub struct GroupMember {
 pub struct GroupMemberInfo {
     pub pubkey:         Vec<u8>,
     pub encrypted_info: Option<Vec<u8>>,
-    pub timestamp:      u64,
+    pub timestamp:      i64,
 }
 
 /// Opaque encrypted member info blob returned by `on_member_info_request`.
@@ -57,5 +57,5 @@ pub struct GroupMemberInfo {
 #[derive(Debug, Clone)]
 pub struct MemberInfoData {
     pub encrypted_blob: Vec<u8>,
-    pub timestamp:      u64,
+    pub timestamp:      i64,
 }

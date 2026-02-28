@@ -59,10 +59,10 @@ pub struct InfoResponse {
 }
 
 pub struct P2pMessage {
-    pub guid:      u64,
-    pub reply_to:  u64,
-    pub send_time: u64,
-    pub edit_time: u64,
+    pub guid:      i64,
+    pub reply_to:  i64,
+    pub send_time: i64,
+    pub edit_time: i64,
     pub msg_type:  i32,
     pub data:      Vec<u8>,
 }
@@ -347,12 +347,12 @@ pub async fn read_message(conn: &AsyncConn) -> Result<P2pMessage, MimirError> {
     let json: serde_json::Value = serde_json::from_slice(&json_bytes)
         .map_err(|e| MimirError::Protocol(format!("bad message JSON: {}", e)))?;
 
-    let guid      = json["guid"]       .as_u64().unwrap_or(0);
-    let reply_to  = json["replyTo"]    .as_u64().unwrap_or(0);
-    let send_time = json["sendTime"]   .as_u64().unwrap_or(0);
-    let edit_time = json["editTime"]   .as_u64().unwrap_or(0);
+    let guid      = json["guid"]       .as_i64().unwrap_or(0);
+    let reply_to  = json["replyTo"]    .as_i64().unwrap_or(0);
+    let send_time = json["sendTime"]   .as_i64().unwrap_or(0);
+    let edit_time = json["editTime"]   .as_i64().unwrap_or(0);
     let msg_type  = json["type"]       .as_i64().unwrap_or(0) as i32;
-    let payload_size = json["payloadSize"].as_u64().unwrap_or(0) as usize;
+    let payload_size = json["payloadSize"].as_i64().unwrap_or(0) as usize;
 
     let data = if payload_size > 0 {
         read_exact(conn, payload_size).await?

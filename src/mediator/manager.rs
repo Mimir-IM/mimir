@@ -16,44 +16,39 @@ use super::client::MediatorClient;
 
 // ── Reconnection parameters ───────────────────────────────────────────────────
 
-const BASE_DELAY:    Duration = Duration::from_secs(2);
-const MAX_DELAY:     Duration = Duration::from_secs(120);
-const MAX_ATTEMPTS:  u32      = 300;
+const BASE_DELAY: Duration = Duration::from_secs(2);
+const MAX_DELAY: Duration = Duration::from_secs(120);
+const MAX_ATTEMPTS: u32 = 300;
 
 pub struct MediatorManager {
-    node:     Arc<AsyncNode>,
-    sk:       Arc<SigningKey>,
-    port:     u16,
+    node: Arc<AsyncNode>,
+    sk: Arc<SigningKey>,
+    port: u16,
     listener: Arc<dyn MediatorEventListener>,
     /// pubkey (hex) → live MediatorClient
-    clients:  Mutex<HashMap<String, MediatorClient>>,
+    clients: Mutex<HashMap<String, MediatorClient>>,
     /// pubkey (hex) → reconnection attempt count
     attempts: Mutex<HashMap<String, u32>>,
     /// stop signal cancels all reconnect tasks
-    stop_tx:  broadcast::Sender<()>,
+    stop_tx: broadcast::Sender<()>,
 }
 
 impl MediatorManager {
-    pub fn new(
-        node:     Arc<AsyncNode>,
-        sk:       Arc<SigningKey>,
-        port:     u16,
-        listener: Arc<dyn MediatorEventListener>,
-    ) -> Self {
+    pub fn new(node: Arc<AsyncNode>, sk: Arc<SigningKey>, port: u16, listener: Arc<dyn MediatorEventListener>) -> Self {
         let (stop_tx, _) = broadcast::channel::<()>(1);
         MediatorManager {
-            node, sk, port, listener,
-            clients:  Mutex::new(HashMap::new()),
+            node,
+            sk,
+            port,
+            listener,
+            clients: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
             stop_tx,
         }
     }
 
     /// Return the running client for `mediator_pubkey`, creating it if needed.
-    pub async fn get_or_create(
-        self: &Arc<Self>,
-        mediator_pubkey: &[u8; 32],
-    ) -> Result<MediatorClient, MimirError> {
+    pub async fn get_or_create(self: &Arc<Self>, mediator_pubkey: &[u8; 32]) -> Result<MediatorClient, MimirError> {
         let hex = hex::encode(mediator_pubkey);
 
         // Check for live existing connection.
@@ -67,16 +62,12 @@ impl MediatorManager {
         self.do_connect(mediator_pubkey, &hex).await
     }
 
-    async fn do_connect(
-        self: &Arc<Self>,
-        mediator_pubkey: &[u8; 32],
-        hex: &str,
-    ) -> Result<MediatorClient, MimirError> {
+    async fn do_connect(self: &Arc<Self>, mediator_pubkey: &[u8; 32], hex: &str) -> Result<MediatorClient, MimirError> {
         // Wrap the user's listener so that on_disconnected also schedules reconnect.
         let wrapped: Arc<dyn MediatorEventListener> = Arc::new(ReconnectListener {
-            inner:   Arc::clone(&self.listener),
+            inner: Arc::clone(&self.listener),
             manager: Arc::clone(self),
-            pubkey:  *mediator_pubkey,
+            pubkey: *mediator_pubkey,
         });
 
         let client = MediatorClient::connect(
@@ -134,7 +125,7 @@ impl MediatorManager {
         }
 
         let exponent = (attempt - 1).min(30) as u32;
-        let delay    = BASE_DELAY.saturating_mul(1u32 << exponent).min(MAX_DELAY);
+        let delay = BASE_DELAY.saturating_mul(1u32 << exponent).min(MAX_DELAY);
         log::info!("mediator {}: reconnecting in {delay:?} (attempt {attempt})", &hex[..8]);
 
         let mgr = Arc::clone(self);
@@ -174,9 +165,9 @@ impl MediatorManager {
 // a reconnect, then forwards every event to the real listener.
 
 struct ReconnectListener {
-    inner:   Arc<dyn MediatorEventListener>,
+    inner: Arc<dyn MediatorEventListener>,
     manager: Arc<MediatorManager>,
-    pubkey:  [u8; 32],
+    pubkey: [u8; 32],
 }
 
 impl MediatorEventListener for ReconnectListener {
@@ -185,22 +176,22 @@ impl MediatorEventListener for ReconnectListener {
     }
 
     fn on_push_message(
-        &self, chat_id: u64, message_id: u64, guid: u64,
-        timestamp: u64, author: Vec<u8>, data: Vec<u8>,
+        &self, chat_id: i64, message_id: i64, guid: i64,
+        timestamp: i64, author: Vec<u8>, data: Vec<u8>,
     ) {
         self.inner.on_push_message(chat_id, message_id, guid, timestamp, author, data);
     }
 
     fn on_system_message(
-        &self, chat_id: u64, message_id: u64, guid: u64,
-        timestamp: u64, body: Vec<u8>,
+        &self, chat_id: i64, message_id: i64, guid: i64,
+        timestamp: i64, body: Vec<u8>,
     ) {
         self.inner.on_system_message(chat_id, message_id, guid, timestamp, body);
     }
 
     fn on_push_invite(
-        &self, invite_id: u64, chat_id: u64, from_pubkey: Vec<u8>,
-        timestamp: u64, chat_name: String, chat_desc: String,
+        &self, invite_id: i64, chat_id: i64, from_pubkey: Vec<u8>,
+        timestamp: i64, chat_name: String, chat_desc: String,
         chat_avatar: Option<Vec<u8>>, encrypted_data: Vec<u8>,
     ) {
         self.inner.on_push_invite(
@@ -209,22 +200,20 @@ impl MediatorEventListener for ReconnectListener {
         );
     }
 
-    fn on_member_info_request(&self, chat_id: u64, last_update: u64)
-        -> Option<crate::types::MemberInfoData>
-    {
+    fn on_member_info_request(&self, chat_id: i64, last_update: i64) -> Option<crate::types::MemberInfoData> {
         self.inner.on_member_info_request(chat_id, last_update)
     }
 
     fn on_member_info_update(
-        &self, chat_id: u64, member_pubkey: Vec<u8>,
-        encrypted_info: Option<Vec<u8>>, timestamp: u64,
+        &self, chat_id: i64, member_pubkey: Vec<u8>,
+        encrypted_info: Option<Vec<u8>>, timestamp: i64,
     ) {
         self.inner.on_member_info_update(chat_id, member_pubkey, encrypted_info, timestamp);
     }
 
     fn on_member_online_status_changed(
-        &self, chat_id: u64, member_pubkey: Vec<u8>,
-        is_online: bool, timestamp: u64,
+        &self, chat_id: i64, member_pubkey: Vec<u8>,
+        is_online: bool, timestamp: i64,
     ) {
         self.inner.on_member_online_status_changed(chat_id, member_pubkey, is_online, timestamp);
     }

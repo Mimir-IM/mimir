@@ -11,7 +11,6 @@ use ed25519_dalek::SigningKey;
 use tokio::sync::{broadcast, mpsc};
 use ygg_stream::AsyncNode;
 
-use yggdrasil::links::PeerEvent;
 
 use crate::{CallStatus, InfoProvider, MimirError, PeerEventListener};
 use connection::{ConnContext, OutgoingCmd, run_inbound, run_outbound};
@@ -50,12 +49,12 @@ impl PeerEventListener for EventWrapper {
         self.inner.on_peer_disconnected(pubkey, address, dead_peer);
     }
 
-    fn on_message_received(&self,pubkey: Vec<u8>, guid: u64, reply_to: u64, send_time: u64, edit_time: u64, msg_type: i32, data: Vec<u8>) {
+    fn on_message_received(&self,pubkey: Vec<u8>, guid: i64, reply_to: i64, send_time: i64, edit_time: i64, msg_type: i32, data: Vec<u8>) {
         self.inner
             .on_message_received(pubkey, guid, reply_to, send_time, edit_time, msg_type, data);
     }
 
-    fn on_message_delivered(&self, pubkey: Vec<u8>, guid: u64) {
+    fn on_message_delivered(&self, pubkey: Vec<u8>, guid: i64) {
         self.inner.on_message_delivered(pubkey, guid);
     }
 
@@ -147,7 +146,14 @@ impl PeerNode {
     /// * `peer_port`      – Port used for P2P connections (listen + outbound).
     /// * `event_listener` – Receives connection and message events.
     /// * `info_provider`  – Supplies and stores contact profile info.
-    pub fn new(signing_key: Vec<u8>, ygg_peers: Vec<String>, peer_port: u16, trackers: Vec<String>, event_listener: Box<dyn PeerEventListener>, info_provider: Box<dyn InfoProvider>) -> Result<Self, MimirError> {
+    pub fn new(
+        signing_key: Vec<u8>,
+        ygg_peers: Vec<String>,
+        peer_port: u16,
+        trackers: Vec<String>,
+        event_listener: Box<dyn PeerEventListener>,
+        info_provider: Box<dyn InfoProvider>
+    ) -> Result<Self, MimirError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -228,30 +234,39 @@ impl PeerNode {
             });
         }
 
+        // Probe initial connectivity — subscribe_peer_events() misses events that
+        // fired during AsyncNode::new_with_key's internal 1-second sleep.
+        let initial_online = rt.block_on(state.node.count_active_peers()) > 0;
+        if initial_online {
+            state.event_cb.on_connectivity_changed(true);
+        }
+
         // Spawn Yggdrasil peer-event monitor → fires on_connectivity_changed.
+        //
+        // On every event (including Lagged) we read the *actual* current peer
+        // count rather than tracking a running delta.  This mirrors the
+        // wait_peer_change pattern in ygg_stream and is immune to counter drift.
         {
             let cb      = Arc::clone(&state.event_cb);
+            let node    = Arc::clone(&state.node);
             let mut rx  = state.node.subscribe_peer_events();
             let mut stop_rx = stop_tx.subscribe();
             rt.spawn(async move {
-                let mut connected: u32 = 0;
+                let mut is_online = initial_online;
                 loop {
                     tokio::select! {
                         biased;
                         _ = stop_rx.recv() => break,
                         result = rx.recv() => {
-                            let was_online = connected > 0;
                             match result {
-                                Ok(PeerEvent::Connected { .. }) => connected += 1,
-                                Ok(PeerEvent::Disconnected { .. }) => {
-                                    connected = connected.saturating_sub(1);
+                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    let now_online = node.count_active_peers().await > 0;
+                                    if now_online != is_online {
+                                        is_online = now_online;
+                                        cb.on_connectivity_changed(now_online);
+                                    }
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                            let is_online = connected > 0;
-                            if is_online != was_online {
-                                cb.on_connectivity_changed(is_online);
+                                Err(broadcast::error::RecvError::Closed) => break,
                             }
                         }
                     }
@@ -274,7 +289,7 @@ impl PeerNode {
     /// Queue a message for delivery to the peer identified by `pubkey`.
     ///
     /// The connection must already be established (`on_peer_connected` fired).
-    pub fn send_message(&self, pubkey: Vec<u8>, guid: u64, reply_to: u64, send_time: u64, edit_time: u64, msg_type: i32, data: Vec<u8>) -> Result<(), MimirError> {
+    pub fn send_message(&self, pubkey: Vec<u8>, guid: i64, reply_to: i64, send_time: i64, edit_time: i64, msg_type: i32, data: Vec<u8>) -> Result<(), MimirError> {
         let key = vec_to_key(&pubkey)?;
         self.state.send_cmd(
             &key,
@@ -375,6 +390,27 @@ impl PeerNode {
         self.state.send_cmd(&key, OutgoingCmd::HangupCall)
     }
 
+    /// Send a raw call-packet to `pubkey` during an active call.
+    pub fn send_call_packet(&self, pubkey: Vec<u8>, data: Vec<u8>) -> Result<(), MimirError> {
+        let key = vec_to_key(&pubkey)?;
+        self.state.send_cmd(&key, OutgoingCmd::CallPacket(data))
+    }
+
+    /// Yggdrasil peer-connection diagnostics, JSON-encoded.
+    pub fn get_peers_json(&self) -> String {
+        self.rt.block_on(self.state.node.get_peers_json())
+    }
+
+    /// Yggdrasil routing-path diagnostics, JSON-encoded.
+    pub fn get_paths_json(&self) -> String {
+        self.rt.block_on(self.state.node.get_paths_json())
+    }
+
+    /// Yggdrasil spanning-tree diagnostics, JSON-encoded.
+    pub fn get_tree_json(&self) -> String {
+        self.rt.block_on(self.state.node.get_tree_json())
+    }
+
     /// Announce our current ephemeral Yggdrasil address to all configured trackers.
     ///
     /// Returns immediately; the actual network I/O runs in the background.
@@ -389,7 +425,7 @@ impl PeerNode {
 
     // ── Crate-internal accessors (used by MediatorNode) ──────────────────────
 
-    pub(crate) fn ygg_node(&self) -> Arc<ygg_stream::AsyncNode> {
+    pub(crate) fn ygg_node(&self) -> Arc<AsyncNode> {
         Arc::clone(&self.state.node)
     }
 
@@ -397,7 +433,7 @@ impl PeerNode {
         Arc::clone(&self.rt)
     }
 
-    pub(crate) fn signing_key(&self) -> Arc<ed25519_dalek::SigningKey> {
+    pub(crate) fn signing_key(&self) -> Arc<SigningKey> {
         Arc::clone(&self.state.signing_key)
     }
 

@@ -153,6 +153,10 @@ pub fn write_tlv_u64(buf: &mut Vec<u8>, tag: u8, v: u64) {
     write_tlv(buf, tag, &v.to_be_bytes());
 }
 
+pub fn write_tlv_i64(buf: &mut Vec<u8>, tag: u8, v: i64) {
+    write_tlv(buf, tag, &v.to_be_bytes());
+}
+
 pub fn write_tlv_u32(buf: &mut Vec<u8>, tag: u8, v: u32) {
     write_tlv(buf, tag, &v.to_be_bytes());
 }
@@ -196,6 +200,8 @@ pub trait TlvExt {
     fn get_str(&self, tag: u8) -> Result<String, MimirError>;
     fn opt_bytes(&self, tag: u8) -> Option<Vec<u8>>;
     fn opt_u64(&self, tag: u8) -> Option<u64>;
+    fn get_i64(&self, tag: u8) -> Result<i64, MimirError>;
+    fn opt_i64(&self, tag: u8) -> Option<i64>;
 }
 
 impl TlvExt for HashMap<u8, Vec<u8>> {
@@ -213,6 +219,16 @@ impl TlvExt for HashMap<u8, Vec<u8>> {
             )));
         }
         Ok(u64::from_be_bytes(b.try_into().unwrap()))
+    }
+
+    fn get_i64(&self, tag: u8) -> Result<i64, MimirError> {
+        let b = self.get_bytes(tag)?;
+        if b.len() != 8 {
+            return Err(MimirError::Protocol(format!(
+                "TLV 0x{tag:02x}: expected 8 bytes, got {}", b.len()
+            )));
+        }
+        Ok(i64::from_be_bytes(b.try_into().unwrap()))
     }
 
     fn get_u32(&self, tag: u8) -> Result<u32, MimirError> {
@@ -239,6 +255,15 @@ impl TlvExt for HashMap<u8, Vec<u8>> {
         let b = self.get(&tag)?;
         if b.len() == 8 {
             Some(u64::from_be_bytes(b.as_slice().try_into().ok()?))
+        } else {
+            None
+        }
+    }
+
+    fn opt_i64(&self, tag: u8) -> Option<i64> {
+        let b = self.get(&tag)?;
+        if b.len() == 8 {
+            Some(i64::from_be_bytes(b.as_slice().try_into().ok()?))
         } else {
             None
         }

@@ -53,13 +53,7 @@ impl MediatorClient {
     /// Dial `mediator_pubkey` on `port`, authenticate, and spawn background tasks.
     ///
     /// Returns the ready-to-use client or an error.
-    pub async fn connect(
-        node:           &AsyncNode,
-        mediator_pubkey: [u8; 32],
-        port:            u16,
-        sk:              Arc<SigningKey>,
-        listener:        Arc<dyn MediatorEventListener>,
-    ) -> Result<Self, MimirError> {
+    pub async fn connect(node: &AsyncNode, mediator_pubkey: [u8; 32], port: u16, sk: Arc<SigningKey>, listener: Arc<dyn MediatorEventListener>) -> Result<Self, MimirError> {
         let conn = node.connect(&mediator_pubkey, port).await
             .map_err(|e| MimirError::Connection(e.to_string()))?;
         let conn = Arc::new(conn);
@@ -132,13 +126,7 @@ impl MediatorClient {
     // ── Public command methods ─────────────────────────────────────────────────
 
     /// `CMD_CREATE_CHAT` — includes proof-of-work (may take a few seconds).
-    pub async fn create_chat(
-        &self,
-        sk:          &SigningKey,
-        name:        &str,
-        description: &str,
-        avatar:      Option<&[u8]>,
-    ) -> Result<u64, MimirError> {
+    pub async fn create_chat(&self, sk: &SigningKey, name: &str, description: &str, avatar: Option<&[u8]>) -> Result<i64, MimirError> {
         let our_pubkey = crate::crypto::pubkey_of(sk);
 
         // GET_NONCE first.
@@ -167,26 +155,20 @@ impl MediatorClient {
             return Err(resp.into_error("createChat"));
         }
         let tlvs = parse_tlvs(&resp.payload)?;
-        tlvs.get_u64(TAG_CHAT_ID)
+        tlvs.get_i64(TAG_CHAT_ID)
     }
 
-    pub async fn delete_chat(&self, chat_id: u64) -> Result<(), MimirError> {
+    pub async fn delete_chat(&self, chat_id: i64) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
         let resp = self.request(CMD_DELETE_CHAT, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("deleteChat")); }
         Ok(())
     }
 
-    pub async fn update_chat_info(
-        &self,
-        chat_id: u64,
-        name:    Option<&str>,
-        desc:    Option<&str>,
-        avatar:  Option<&[u8]>,
-    ) -> Result<(), MimirError> {
+    pub async fn update_chat_info(&self, chat_id: i64, name: Option<&str>, desc: Option<&str>, avatar: Option<&[u8]>) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
         if let Some(n) = name   { write_tlv_str(&mut p, TAG_CHAT_NAME, n); }
         if let Some(d) = desc   { write_tlv_str(&mut p, TAG_CHAT_DESC, d); }
         if let Some(a) = avatar { write_tlv(&mut p, TAG_CHAT_AVATAR, a); }
@@ -195,18 +177,18 @@ impl MediatorClient {
         Ok(())
     }
 
-    pub async fn add_user(&self, chat_id: u64, user_pubkey: &[u8]) -> Result<(), MimirError> {
+    pub async fn add_user(&self, chat_id: i64, user_pubkey: &[u8]) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,     chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,     chat_id);
         write_tlv(&mut p,     TAG_USER_PUBKEY, user_pubkey);
         let resp = self.request(CMD_ADD_USER, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("addUser")); }
         Ok(())
     }
 
-    pub async fn delete_user(&self, chat_id: u64, user_pubkey: &[u8]) -> Result<(), MimirError> {
+    pub async fn delete_user(&self, chat_id: i64, user_pubkey: &[u8]) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,     chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,     chat_id);
         write_tlv(&mut p,     TAG_USER_PUBKEY, user_pubkey);
         let resp = self.request(CMD_DELETE_USER, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("deleteUser")); }
@@ -215,7 +197,7 @@ impl MediatorClient {
 
     /// Returns the list of chat IDs this user is a member of on the server.
     /// Used internally after (re)connect to resubscribe to all chats.
-    pub(super) async fn get_user_chats(&self) -> Result<Vec<u64>, MimirError> {
+    pub(super) async fn get_user_chats(&self) -> Result<Vec<i64>, MimirError> {
         let resp = self.request(CMD_GET_USER_CHATS, &[]).await?;
         if resp.status != STATUS_OK {
             return Err(resp.into_error("getUserChats"));
@@ -233,93 +215,77 @@ impl MediatorClient {
                 return Err(MimirError::Protocol("getUserChats: TLV overrun".into()));
             }
             if tag == TAG_CHAT_ID && len == 8 {
-                chat_ids.push(u64::from_be_bytes(p[offset..end].try_into().unwrap()));
+                chat_ids.push(i64::from_be_bytes(p[offset..end].try_into().unwrap()));
             }
             offset = end;
         }
         Ok(chat_ids)
     }
 
-    pub async fn leave_chat(&self, chat_id: u64) -> Result<(), MimirError> {
+    pub async fn leave_chat(&self, chat_id: i64) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
         let resp = self.request(CMD_LEAVE_CHAT, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("leaveChat")); }
         Ok(())
     }
 
     /// Returns the server's last message ID for the chat (used to detect missed messages).
-    pub async fn subscribe(&self, chat_id: u64) -> Result<u64, MimirError> {
+    pub async fn subscribe(&self, chat_id: i64) -> Result<i64, MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
         let resp = self.request(CMD_SUBSCRIBE, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("subscribe")); }
         let tlvs = parse_tlvs(&resp.payload)?;
-        tlvs.get_u64(TAG_MESSAGE_ID)
+        tlvs.get_i64(TAG_MESSAGE_ID)
     }
 
     /// Returns `(message_id, guid)`.
-    pub async fn send_message(
-        &self,
-        chat_id:   u64,
-        guid:      u64,
-        timestamp: u64,
-        data:      &[u8],
-    ) -> Result<(u64, u64), MimirError> {
+    pub async fn send_message(&self, chat_id: i64, guid: i64, timestamp: i64, data: &[u8]) -> Result<(i64, i64), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,      chat_id);
-        write_tlv_u64(&mut p, TAG_MESSAGE_GUID,  guid);
-        write_tlv_u64(&mut p, TAG_TIMESTAMP,     timestamp);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,      chat_id);
+        write_tlv_i64(&mut p, TAG_MESSAGE_GUID,  guid);
+        write_tlv_i64(&mut p, TAG_TIMESTAMP,     timestamp);
         write_tlv(&mut p,     TAG_MESSAGE_BLOB,  data);
         let resp = self.request(CMD_SEND_MESSAGE, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("sendMessage")); }
         let tlvs = parse_tlvs(&resp.payload)?;
-        let msg_id  = tlvs.get_u64(TAG_MESSAGE_ID)?;
-        let new_guid = tlvs.opt_u64(TAG_MESSAGE_GUID).unwrap_or(guid);
+        let msg_id  = tlvs.get_i64(TAG_MESSAGE_ID)?;
+        let new_guid = tlvs.opt_i64(TAG_MESSAGE_GUID).unwrap_or(guid);
         Ok((msg_id, new_guid))
     }
 
-    pub async fn delete_message(&self, chat_id: u64, message_id: u64) -> Result<(), MimirError> {
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,    chat_id);
-        write_tlv_u64(&mut p, TAG_MESSAGE_ID, message_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,    chat_id);
+        write_tlv_i64(&mut p, TAG_MESSAGE_ID, message_id);
         let resp = self.request(CMD_DELETE_MESSAGE, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("deleteMessage")); }
         Ok(())
     }
 
-    pub async fn get_last_message_id(&self, chat_id: u64) -> Result<u64, MimirError> {
+    pub async fn get_last_message_id(&self, chat_id: i64) -> Result<i64, MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
         let resp = self.request(CMD_GET_LAST_MESSAGE_ID, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("getLastMessageId")); }
         let tlvs = parse_tlvs(&resp.payload)?;
-        tlvs.get_u64(TAG_MESSAGE_ID)
+        tlvs.get_i64(TAG_MESSAGE_ID)
     }
 
-    pub async fn get_messages_since(
-        &self,
-        chat_id:  u64,
-        since_id: u64,
-        limit:    u32,
-    ) -> Result<Vec<GroupMessage>, MimirError> {
+    pub async fn get_messages_since(&self, chat_id: i64, since_id: i64, limit: u32) -> Result<Vec<GroupMessage>, MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,  chat_id);
-        write_tlv_u64(&mut p, TAG_SINCE_ID, since_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,  chat_id);
+        write_tlv_i64(&mut p, TAG_SINCE_ID, since_id);
         write_tlv_u32(&mut p, TAG_LIMIT,    limit);
         let resp = self.request(CMD_GET_MESSAGES_SINCE, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("getMessagesSince")); }
         parse_messages_list(&resp.payload)
     }
 
-    pub async fn send_invite(
-        &self,
-        chat_id:        u64,
-        recipient:      &[u8],
-        encrypted_data: &[u8],
-    ) -> Result<(), MimirError> {
+    pub async fn send_invite(&self, chat_id: i64, recipient: &[u8], encrypted_data: &[u8]) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,    chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,    chat_id);
         write_tlv(&mut p,     TAG_USER_PUBKEY, recipient);
         write_tlv(&mut p,     TAG_INVITE_DATA, encrypted_data);
         let resp = self.request(CMD_SEND_INVITE, &p).await?;
@@ -327,67 +293,48 @@ impl MediatorClient {
         Ok(())
     }
 
-    pub async fn respond_to_invite(
-        &self,
-        chat_id:   u64,
-        invite_id: u64,
-        accept:    bool,
-    ) -> Result<(), MimirError> {
+    pub async fn respond_to_invite(&self, chat_id: i64, invite_id: i64, accept: bool) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,   chat_id);
-        write_tlv_u64(&mut p, TAG_INVITE_ID, invite_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,   chat_id);
+        write_tlv_i64(&mut p, TAG_INVITE_ID, invite_id);
         write_tlv_u8(&mut p,  TAG_ACCEPTED,  accept as u8);
         let resp = self.request(CMD_INVITE_RESPONSE, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("respondToInvite")); }
         Ok(())
     }
 
-    pub async fn update_member_info(
-        &self,
-        chat_id:        u64,
-        encrypted_blob: &[u8],
-        timestamp:      u64,
-    ) -> Result<(), MimirError> {
+    pub async fn update_member_info(&self, chat_id: i64, encrypted_blob: &[u8], timestamp: i64) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,     chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,     chat_id);
         write_tlv(&mut p,     TAG_MEMBER_INFO, encrypted_blob);
-        write_tlv_u64(&mut p, TAG_TIMESTAMP,   timestamp);
+        write_tlv_i64(&mut p, TAG_TIMESTAMP,   timestamp);
         let resp = self.request(CMD_UPDATE_MEMBER_INFO, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("updateMemberInfo")); }
         Ok(())
     }
 
-    pub async fn get_members_info(
-        &self,
-        chat_id:         u64,
-        since_timestamp: u64,
-    ) -> Result<Vec<GroupMemberInfo>, MimirError> {
+    pub async fn get_members_info(&self, chat_id: i64, since_timestamp: i64) -> Result<Vec<GroupMemberInfo>, MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,     chat_id);
-        write_tlv_u64(&mut p, TAG_LAST_UPDATE, since_timestamp);
+        write_tlv_i64(&mut p, TAG_CHAT_ID,     chat_id);
+        write_tlv_i64(&mut p, TAG_LAST_UPDATE, since_timestamp);
         let resp = self.request(CMD_GET_MEMBERS_INFO, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("getMembersInfo")); }
         parse_members_info_list(&resp.payload)
     }
 
-    pub async fn get_members(&self, chat_id: u64) -> Result<Vec<GroupMember>, MimirError> {
+    pub async fn get_members(&self, chat_id: i64) -> Result<Vec<GroupMember>, MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
         let resp = self.request(CMD_GET_MEMBERS, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("getMembers")); }
         parse_members_list(&resp.payload)
     }
 
-    pub async fn change_member_status(
-        &self,
-        chat_id:         u64,
-        user_pubkey:     &[u8],
-        new_permissions: u8,
-    ) -> Result<(), MimirError> {
+    pub async fn change_member_status(&self, chat_id: i64, user_pubkey: &[u8], new_permissions: u8) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_u64(&mut p, TAG_CHAT_ID,     chat_id);
-        write_tlv(&mut p,     TAG_USER_PUBKEY, user_pubkey);
-        write_tlv_u8(&mut p,  TAG_PERMS,       new_permissions);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv(&mut p, TAG_USER_PUBKEY, user_pubkey);
+        write_tlv_u8(&mut p, TAG_PERMS, new_permissions);
         let resp = self.request(CMD_CHANGE_MEMBER_STATUS, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("changeMemberStatus")); }
         Ok(())
@@ -520,10 +467,10 @@ impl MediatorClient {
             Ok(t)  => t,
             Err(e) => { log::error!("push_message parse error: {e}"); return; }
         };
-        let chat_id    = tlvs.get_u64(TAG_CHAT_ID).unwrap_or(0);
-        let message_id = tlvs.get_u64(TAG_MESSAGE_ID).unwrap_or(0);
-        let guid       = tlvs.get_u64(TAG_MESSAGE_GUID).unwrap_or(0);
-        let timestamp  = tlvs.get_u64(TAG_TIMESTAMP).unwrap_or(0)
+        let chat_id    = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
+        let message_id = tlvs.get_i64(TAG_MESSAGE_ID).unwrap_or(0);
+        let guid       = tlvs.get_i64(TAG_MESSAGE_GUID).unwrap_or(0);
+        let timestamp  = tlvs.get_i64(TAG_TIMESTAMP).unwrap_or(0)
             .saturating_mul(1000); // seconds → milliseconds
         let author     = tlvs.opt_bytes(TAG_PUBKEY).unwrap_or_default();
         let data       = tlvs.opt_bytes(TAG_MESSAGE_BLOB).unwrap_or_default();
@@ -535,7 +482,7 @@ impl MediatorClient {
                 let member_pubkey = data[1..33].to_vec();
                 let is_online     = data[33] == 1;
                 let ts_bytes: [u8; 8] = data[34..42].try_into().unwrap_or([0; 8]);
-                let ts = u64::from_be_bytes(ts_bytes);
+                let ts = i64::from_be_bytes(ts_bytes);
                 listener.on_member_online_status_changed(chat_id, member_pubkey, is_online, ts);
             } else {
                 listener.on_system_message(chat_id, message_id, guid, timestamp, data);
@@ -550,10 +497,10 @@ impl MediatorClient {
             Ok(t)  => t,
             Err(e) => { log::error!("push_invite parse error: {e}"); return; }
         };
-        let invite_id  = tlvs.get_u64(TAG_INVITE_ID).unwrap_or(0);
-        let chat_id    = tlvs.get_u64(TAG_CHAT_ID).unwrap_or(0);
+        let invite_id  = tlvs.get_i64(TAG_INVITE_ID).unwrap_or(0);
+        let chat_id    = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
         let from       = tlvs.opt_bytes(TAG_PUBKEY).unwrap_or_default();
-        let timestamp  = tlvs.get_u64(TAG_TIMESTAMP).unwrap_or(0)
+        let timestamp  = tlvs.get_i64(TAG_TIMESTAMP).unwrap_or(0)
             .saturating_mul(1000);
         let name       = String::from_utf8(
             tlvs.opt_bytes(TAG_CHAT_NAME).unwrap_or_default()
@@ -567,17 +514,13 @@ impl MediatorClient {
         listener.on_push_invite(invite_id, chat_id, from, timestamp, name, desc, avatar, enc_data);
     }
 
-    async fn handle_member_info_request(
-        &self,
-        payload:  Vec<u8>,
-        listener: &dyn MediatorEventListener,
-    ) {
+    async fn handle_member_info_request(&self,payload:  Vec<u8>, listener: &dyn MediatorEventListener) {
         let tlvs = match parse_tlvs(&payload) {
             Ok(t)  => t,
             Err(e) => { log::error!("member_info_request parse error: {e}"); return; }
         };
-        let chat_id     = tlvs.get_u64(TAG_CHAT_ID).unwrap_or(0);
-        let last_update = tlvs.opt_u64(TAG_LAST_UPDATE).unwrap_or(0);
+        let chat_id     = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
+        let last_update = tlvs.opt_i64(TAG_LAST_UPDATE).unwrap_or(0);
 
         if let Some(info) = listener.on_member_info_request(chat_id, last_update) {
             let self2 = self.clone();
@@ -599,10 +542,10 @@ impl MediatorClient {
             Ok(t)  => t,
             Err(e) => { log::error!("member_info_update parse error: {e}"); return; }
         };
-        let chat_id       = tlvs.get_u64(TAG_CHAT_ID).unwrap_or(0);
+        let chat_id       = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
         let member_pubkey = tlvs.opt_bytes(TAG_USER_PUBKEY).unwrap_or_default();
         let encrypted     = tlvs.opt_bytes(TAG_MEMBER_INFO);
-        let timestamp     = tlvs.get_u64(TAG_TIMESTAMP).unwrap_or(0);
+        let timestamp     = tlvs.get_i64(TAG_TIMESTAMP).unwrap_or(0);
 
         listener.on_member_info_update(chat_id, member_pubkey, encrypted, timestamp);
     }
@@ -667,9 +610,9 @@ fn parse_messages_list(payload: &[u8]) -> Result<Vec<GroupMessage>, MimirError> 
     let mut offset = 0;
 
     // Current record fields.
-    let mut message_id: Option<u64> = None;
-    let mut guid:       Option<u64> = None;
-    let mut timestamp:  Option<u64> = None;
+    let mut message_id: Option<i64> = None;
+    let mut guid:       Option<i64> = None;
+    let mut timestamp:  Option<i64> = None;
     let mut author:     Option<Vec<u8>> = None;
     let mut data:       Option<Vec<u8>> = None;
 
@@ -703,17 +646,17 @@ fn parse_messages_list(payload: &[u8]) -> Result<Vec<GroupMessage>, MimirError> 
                 // Start of a new record — flush previous if any.
                 if message_id.is_some() { flush!(); }
                 if value.len() == 8 {
-                    message_id = Some(u64::from_be_bytes(value.try_into().unwrap()));
+                    message_id = Some(i64::from_be_bytes(value.try_into().unwrap()));
                 }
             }
             TAG_MESSAGE_GUID => {
                 if value.len() == 8 {
-                    guid = Some(u64::from_be_bytes(value.try_into().unwrap()));
+                    guid = Some(i64::from_be_bytes(value.try_into().unwrap()));
                 }
             }
             TAG_TIMESTAMP => {
                 if value.len() == 8 {
-                    timestamp = Some(u64::from_be_bytes(value.try_into().unwrap()));
+                    timestamp = Some(i64::from_be_bytes(value.try_into().unwrap()));
                 }
             }
             TAG_PUBKEY => { author = Some(value.to_vec()); }
@@ -731,7 +674,7 @@ fn parse_members_info_list(payload: &[u8]) -> Result<Vec<GroupMemberInfo>, Mimir
 
     let mut pubkey:    Option<Vec<u8>> = None;
     let mut enc_info:  Option<Vec<u8>> = None;
-    let mut timestamp: Option<u64>     = None;
+    let mut timestamp: Option<i64>     = None;
 
     macro_rules! flush {
         () => {
@@ -764,7 +707,7 @@ fn parse_members_info_list(payload: &[u8]) -> Result<Vec<GroupMemberInfo>, Mimir
             TAG_MEMBER_INFO => { enc_info  = Some(value.to_vec()); }
             TAG_TIMESTAMP   => {
                 if value.len() == 8 {
-                    timestamp = Some(u64::from_be_bytes(value.try_into().unwrap()));
+                    timestamp = Some(i64::from_be_bytes(value.try_into().unwrap()));
                 }
             }
             _ => {}
@@ -781,7 +724,7 @@ fn parse_members_list(payload: &[u8]) -> Result<Vec<GroupMember>, MimirError> {
     let mut pubkey:    Option<Vec<u8>> = None;
     let mut perms:     u32             = 0;
     let mut online:    bool            = false;
-    let mut last_seen: u64             = 0;
+    let mut last_seen: i64             = 0;
 
     macro_rules! flush {
         () => {
@@ -823,7 +766,7 @@ fn parse_members_list(payload: &[u8]) -> Result<Vec<GroupMember>, MimirError> {
             }
             TAG_LAST_SEEN => {
                 if value.len() == 8 {
-                    last_seen = u64::from_be_bytes(value.try_into().unwrap());
+                    last_seen = i64::from_be_bytes(value.try_into().unwrap());
                 }
             }
             _ => {}
