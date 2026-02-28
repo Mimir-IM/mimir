@@ -10,6 +10,8 @@ use ed25519_dalek::SigningKey;
 use tokio::sync::{broadcast, mpsc};
 use ygg_stream::AsyncNode;
 
+use yggdrasil::links::PeerEvent;
+
 use crate::{CallStatus, InfoProvider, MimirError, PeerEventListener};
 use connection::{ConnContext, OutgoingCmd, run_inbound, run_outbound};
 
@@ -28,6 +30,10 @@ struct EventWrapper {
 }
 
 impl PeerEventListener for EventWrapper {
+    fn on_connectivity_changed(&self, is_online: bool) {
+        self.inner.on_connectivity_changed(is_online);
+    }
+
     fn on_peer_connected(&self, pubkey: Vec<u8>, address: String) {
         self.inner.on_peer_connected(pubkey, address);
     }
@@ -42,17 +48,9 @@ impl PeerEventListener for EventWrapper {
         self.inner.on_peer_disconnected(pubkey, address, dead_peer);
     }
 
-    fn on_message_received(
-        &self,
-        pubkey:    Vec<u8>,
-        guid:      u64,
-        reply_to:  u64,
-        send_time: u64,
-        edit_time: u64,
-        msg_type:  i32,
-        data:      Vec<u8>,
-    ) {
-        self.inner.on_message_received(pubkey, guid, reply_to, send_time, edit_time, msg_type, data);
+    fn on_message_received(&self,pubkey: Vec<u8>, guid: u64, reply_to: u64, send_time: u64, edit_time: u64, msg_type: i32, data: Vec<u8>) {
+        self.inner
+            .on_message_received(pubkey, guid, reply_to, send_time, edit_time, msg_type, data);
     }
 
     fn on_message_delivered(&self, pubkey: Vec<u8>, guid: u64) {
@@ -75,24 +73,24 @@ impl PeerEventListener for EventWrapper {
 // ── Shared runtime state ──────────────────────────────────────────────────────
 
 struct PeerState {
-    our_pubkey:  [u8; 32],
+    our_pubkey: [u8; 32],
     signing_key: Arc<SigningKey>,
-    node:        Arc<AsyncNode>,
-    peer_port:   u16,
-    client_id:   i32,
-    peers:       Arc<PeersMap>,
-    event_cb:    Arc<dyn PeerEventListener>,
-    info_cb:     Arc<dyn InfoProvider>,
+    node: Arc<AsyncNode>,
+    peer_port: u16,
+    client_id: i32,
+    peers: Arc<PeersMap>,
+    event_cb: Arc<dyn PeerEventListener>,
+    info_cb: Arc<dyn InfoProvider>,
 }
 
 impl PeerState {
     fn make_ctx(&self) -> Arc<ConnContext> {
         Arc::new(ConnContext {
             signing_key: Arc::clone(&self.signing_key),
-            our_pubkey:  self.our_pubkey,
-            client_id:   self.client_id,
-            event_cb:    Arc::clone(&self.event_cb),
-            info_cb:     Arc::clone(&self.info_cb),
+            our_pubkey: self.our_pubkey,
+            client_id: self.client_id,
+            event_cb: Arc::clone(&self.event_cb),
+            info_cb: Arc::clone(&self.info_cb),
         })
     }
 
@@ -103,21 +101,25 @@ impl PeerState {
     }
 
     fn send_cmd(&self, pubkey: &[u8; 32], cmd: OutgoingCmd) -> Result<(), MimirError> {
-        let map = self.peers.lock()
+        let map = self
+            .peers
+            .lock()
             .map_err(|_| MimirError::Connection("peers lock poisoned".to_string()))?;
         match map.get(pubkey) {
             Some(tx) if !tx.is_closed() => {
-                tx.send(cmd).map_err(|_| MimirError::Connection(
-                    format!("peer {} channel closed", hex::encode(pubkey))
-                ))?;
+                tx.send(cmd).map_err(|_| {
+                    MimirError::Connection(format!("peer {} channel closed", hex::encode(pubkey)))
+                })?;
                 Ok(())
             }
-            Some(_) => Err(MimirError::Connection(
-                format!("peer {} is disconnected", hex::encode(pubkey))
-            )),
-            None => Err(MimirError::Connection(
-                format!("no connection to {}", hex::encode(pubkey))
-            )),
+            Some(_) => Err(MimirError::Connection(format!(
+                "peer {} is disconnected",
+                hex::encode(pubkey)
+            ))),
+            None => Err(MimirError::Connection(format!(
+                "no connection to {}",
+                hex::encode(pubkey)
+            ))),
         }
     }
 }
@@ -129,8 +131,8 @@ impl PeerState {
 /// Starts a Yggdrasil node, an inbound-connection accept loop, and manages
 /// all authenticated P2P connections to contacts.
 pub struct PeerNode {
-    rt:      Arc<tokio::runtime::Runtime>,
-    state:   Arc<PeerState>,
+    rt: Arc<tokio::runtime::Runtime>,
+    state: Arc<PeerState>,
     stop_tx: broadcast::Sender<()>,
 }
 
@@ -142,13 +144,7 @@ impl PeerNode {
     /// * `peer_port`      – Port used for P2P connections (listen + outbound).
     /// * `event_listener` – Receives connection and message events.
     /// * `info_provider`  – Supplies and stores contact profile info.
-    pub fn new(
-        signing_key:    Vec<u8>,
-        ygg_peers:      Vec<String>,
-        peer_port:      u16,
-        event_listener: Box<dyn PeerEventListener>,
-        info_provider:  Box<dyn InfoProvider>,
-    ) -> Result<Self, MimirError> {
+    pub fn new(signing_key: Vec<u8>, ygg_peers: Vec<String>, peer_port: u16, event_listener: Box<dyn PeerEventListener>, info_provider: Box<dyn InfoProvider>) -> Result<Self, MimirError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -173,7 +169,7 @@ impl PeerNode {
         // events also remove the peer from the command-sender map.
         let peers: Arc<PeersMap> = Arc::new(Mutex::new(HashMap::new()));
         let event_listener: Arc<dyn PeerEventListener> = Arc::from(event_listener);
-        let info_provider:  Arc<dyn InfoProvider>      = Arc::from(info_provider);
+        let info_provider: Arc<dyn InfoProvider> = Arc::from(info_provider);
         let event_wrapper: Arc<dyn PeerEventListener> = Arc::new(EventWrapper {
             inner: event_listener,
             peers: Arc::clone(&peers),
@@ -191,7 +187,7 @@ impl PeerNode {
 
         // Spawn the inbound-accept loop.
         {
-            let state2   = Arc::clone(&state);
+            let state2 = Arc::clone(&state);
             let mut stop_rx = stop_tx.subscribe();
             rt.spawn(async move {
                 loop {
@@ -221,6 +217,37 @@ impl PeerNode {
             });
         }
 
+        // Spawn Yggdrasil peer-event monitor → fires on_connectivity_changed.
+        {
+            let cb      = Arc::clone(&state.event_cb);
+            let mut rx  = state.node.subscribe_peer_events();
+            let mut stop_rx = stop_tx.subscribe();
+            rt.spawn(async move {
+                let mut connected: u32 = 0;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop_rx.recv() => break,
+                        result = rx.recv() => {
+                            let was_online = connected > 0;
+                            match result {
+                                Ok(PeerEvent::Connected { .. }) => connected += 1,
+                                Ok(PeerEvent::Disconnected { .. }) => {
+                                    connected = connected.saturating_sub(1);
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                            let is_online = connected > 0;
+                            if is_online != was_online {
+                                cb.on_connectivity_changed(is_online);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(PeerNode {
             rt: Arc::new(rt),
             state,
@@ -236,20 +263,19 @@ impl PeerNode {
     /// Queue a message for delivery to the peer identified by `pubkey`.
     ///
     /// The connection must already be established (`on_peer_connected` fired).
-    pub fn send_message(
-        &self,
-        pubkey:    Vec<u8>,
-        guid:      u64,
-        reply_to:  u64,
-        send_time: u64,
-        edit_time: u64,
-        msg_type:  i32,
-        data:      Vec<u8>,
-    ) -> Result<(), MimirError> {
+    pub fn send_message(&self, pubkey: Vec<u8>, guid: u64, reply_to: u64, send_time: u64, edit_time: u64, msg_type: i32, data: Vec<u8>) -> Result<(), MimirError> {
         let key = vec_to_key(&pubkey)?;
-        self.state.send_cmd(&key, OutgoingCmd::Message {
-            guid, reply_to, send_time, edit_time, msg_type, data,
-        })
+        self.state.send_cmd(
+            &key,
+            OutgoingCmd::Message {
+                guid,
+                reply_to,
+                send_time,
+                edit_time,
+                msg_type,
+                data,
+            },
+        )
     }
 
     /// Open an outbound connection to `pubkey`.
@@ -261,7 +287,10 @@ impl PeerNode {
 
         // Skip if there is already a live connection to this peer.
         {
-            let map = self.state.peers.lock()
+            let map = self
+                .state
+                .peers
+                .lock()
                 .map_err(|_| MimirError::Connection("peers lock poisoned".to_string()))?;
             if let Some(tx) = map.get(&key) {
                 if !tx.is_closed() {
@@ -274,17 +303,14 @@ impl PeerNode {
         self.rt.spawn(async move {
             match state.node.connect(&key, state.peer_port).await {
                 Ok(conn) => {
-                    let ctx  = state.make_ctx();
+                    let ctx = state.make_ctx();
                     let conn = Arc::new(conn);
                     if let Some(tx) = run_outbound(conn, key, ctx).await {
                         state.register_peer(key, tx);
                     }
                 }
                 Err(e) => {
-                    log::error!(
-                        "connect_to_peer {}: {}",
-                        hex::encode(key), e
-                    );
+                    log::error!("connect_to_peer {}: {}", hex::encode(key), e);
                 }
             }
         });
@@ -316,6 +342,20 @@ impl PeerNode {
         self.state.send_cmd(&key, OutgoingCmd::HangupCall)
     }
 
+    // ── Crate-internal accessors (used by MediatorNode) ──────────────────────
+
+    pub(crate) fn ygg_node(&self) -> Arc<ygg_stream::AsyncNode> {
+        Arc::clone(&self.state.node)
+    }
+
+    pub(crate) fn runtime(&self) -> Arc<tokio::runtime::Runtime> {
+        Arc::clone(&self.rt)
+    }
+
+    pub(crate) fn signing_key(&self) -> Arc<ed25519_dalek::SigningKey> {
+        Arc::clone(&self.state.signing_key)
+    }
+
     /// Stop the node and close all connections.
     ///
     /// After this returns, no more events will be fired.
@@ -324,7 +364,10 @@ impl PeerNode {
         let _ = self.stop_tx.send(());
 
         // Tell every peer connection to shut down.
-        let keys: Vec<[u8; 32]> = self.state.peers.lock()
+        let keys: Vec<[u8; 32]> = self
+            .state
+            .peers
+            .lock()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
         for key in keys {
@@ -333,14 +376,16 @@ impl PeerNode {
 
         // Shut down the Yggdrasil node asynchronously (fire-and-forget).
         let node = Arc::clone(&self.state.node);
-        self.rt.spawn(async move { node.close().await; });
+        self.rt.spawn(async move {
+            node.close().await;
+        });
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn vec_to_key(v: &[u8]) -> Result<[u8; 32], MimirError> {
-    v.try_into().map_err(|_| MimirError::Connection(
-        format!("expected 32-byte pubkey, got {} bytes", v.len())
-    ))
+    v.try_into().map_err(|_| {
+        MimirError::Connection(format!("expected 32-byte pubkey, got {} bytes", v.len()))
+    })
 }

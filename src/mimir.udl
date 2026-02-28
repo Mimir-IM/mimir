@@ -1,4 +1,29 @@
-namespace mimir {};
+namespace mimir {
+    // ── Group chat crypto ─────────────────────────────────────────────────────
+
+    /// Generate a random 32-byte shared key for a new group chat.
+    bytes generate_shared_key();
+
+    /// Encrypt `plaintext` with `shared_key`.
+    /// Output: [nonce(12)][ciphertext][tag(16)]
+    [Throws=MimirError]
+    bytes encrypt_message(bytes plaintext, bytes shared_key);
+
+    /// Decrypt a message produced by encrypt_message.
+    /// Input: [nonce(12)][ciphertext][tag(16)]
+    [Throws=MimirError]
+    bytes decrypt_message(bytes encrypted, bytes shared_key);
+
+    /// Encrypt `shared_key` for `recipient_ed25519_pubkey` (ECIES).
+    /// Output: [eph_pubkey(32)][nonce(12)][ciphertext][tag(16)]
+    [Throws=MimirError]
+    bytes encrypt_shared_key(bytes shared_key, bytes recipient_ed25519_pubkey);
+
+    /// Decrypt a shared key produced by encrypt_shared_key.
+    /// `seed` is the 32-byte Ed25519 signing-key seed of the recipient.
+    [Throws=MimirError]
+    bytes decrypt_shared_key(bytes encrypted, bytes seed);
+};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -29,6 +54,38 @@ enum CallStatus {
     "Hangup",     // Call ended
 };
 
+/// A group chat message as returned by get_messages_since.
+dictionary GroupMessage {
+    u64    message_id;
+    u64    guid;
+    u64    timestamp;    // milliseconds since Unix epoch
+    bytes  author;       // 32-byte sender public key
+    bytes  data;         // encrypted message blob
+};
+
+/// Lightweight member entry (pubkey + permissions + online status).
+dictionary GroupMember {
+    bytes  pubkey;
+    u32    permissions;
+    boolean online;
+    u64    last_seen;    // Unix seconds, 0 if currently online or never seen
+};
+
+/// Member entry with encrypted profile blob (from get_members_info).
+dictionary GroupMemberInfo {
+    bytes   pubkey;
+    bytes?  encrypted_info;   // null if member has no profile set
+    u64     timestamp;
+};
+
+/// Pre-encrypted member profile blob returned by on_member_info_request.
+/// Kotlin encrypts (nickname + info + avatar) with the chat shared key
+/// and returns the ciphertext so Rust can transmit it to the mediator.
+dictionary MemberInfoData {
+    bytes  encrypted_blob;
+    u64    timestamp;
+};
+
 // ── Callback interfaces (implemented by Kotlin/Swift) ─────────────────────────
 
 /// Provides local user info and stores contact info received from peers.
@@ -53,6 +110,9 @@ callback interface InfoProvider {
 /// Receives P2P networking events. All callbacks are invoked from Rust
 /// connection tasks and must return quickly.
 callback interface PeerEventListener {
+    /// Yggdrasil overlay network came online (first peer) or went offline (last peer).
+    void on_connectivity_changed(boolean is_online);
+
     /// Mutual authentication succeeded; peer is ready to exchange messages.
     void on_peer_connected(bytes pubkey, string address);
 
@@ -89,6 +149,72 @@ callback interface PeerEventListener {
     /// Passed through directly to the audio subsystem (stays in Kotlin/Swift
     /// until audio moves to Rust in a later phase).
     void on_call_packet(bytes pubkey, bytes data);
+};
+
+/// Receives mediator (group-chat server) events.
+/// All callbacks are invoked from Rust async tasks — must return quickly.
+///
+/// Note: encryption of message blobs is handled by the caller (Kotlin/Swift).
+/// Rust passes encrypted bytes through unchanged.
+callback interface MediatorEventListener {
+    /// Authenticated connection established to this mediator.
+    void on_connected(bytes mediator_pubkey);
+
+    /// An encrypted group chat message arrived from the mediator push.
+    void on_push_message(
+        u64    chat_id,
+        u64    message_id,
+        u64    guid,
+        u64    timestamp,
+        bytes  author,
+        bytes  data
+    );
+
+    /// A mediator-generated system message arrived (always unencrypted).
+    /// body[0] is the event code; see SYS_* constants in the protocol.
+    void on_system_message(
+        u64    chat_id,
+        u64    message_id,
+        u64    guid,
+        u64    timestamp,
+        bytes  body
+    );
+
+    /// A group chat invitation arrived.
+    /// `encrypted_data` is the AES-wrapped shared key for the recipient.
+    void on_push_invite(
+        u64     invite_id,
+        u64     chat_id,
+        bytes   from_pubkey,
+        u64     timestamp,
+        string  chat_name,
+        string  chat_desc,
+        bytes?  chat_avatar,
+        bytes   encrypted_data
+    );
+
+    /// Mediator asks us to (re-)send our encrypted member profile.
+    /// Return MemberInfoData if our info is newer than last_update, else null.
+    MemberInfoData? on_member_info_request(u64 chat_id, u64 last_update);
+
+    /// Mediator broadcast: a member's encrypted profile was updated.
+    void on_member_info_update(
+        u64     chat_id,
+        bytes   member_pubkey,
+        bytes?  encrypted_info,
+        u64     timestamp
+    );
+
+    /// Mediator broadcast: a member came online or went offline.
+    void on_member_online_status_changed(
+        u64     chat_id,
+        bytes   member_pubkey,
+        boolean is_online,
+        u64     timestamp
+    );
+
+    /// Connection to this mediator ended.
+    void on_disconnected(bytes mediator_pubkey);
 };
 
 // ── Main object ───────────────────────────────────────────────────────────────
@@ -160,4 +286,103 @@ interface PeerNode {
 
     /// Stop the node and close all connections.
     void stop();
+};
+
+// ── Mediator / group-chat node ────────────────────────────────────────────────
+
+/// Manages connections to one or more mediator servers.
+///
+/// Shares the Yggdrasil identity from an existing `PeerNode`.
+/// All methods are thread-safe.
+interface MediatorNode {
+    /// Create and start the mediator node.
+    ///
+    /// `peer_node`      – Running PeerNode (its Ygg node + runtime are shared).
+    /// `mediator_port`  – Port mediator servers listen on.
+    /// `event_listener` – Receives all mediator events.
+    [Throws=MimirError]
+    constructor(
+        PeerNode               peer_node,
+        u16                    mediator_port,
+        MediatorEventListener  event_listener
+    );
+
+    // ── Connection ────────────────────────────────────────────────────────────
+
+    /// Dial a mediator.  Returns immediately; on_connected fires on success.
+    [Throws=MimirError]
+    void connect_to_mediator(bytes mediator_pubkey);
+
+    /// Stop all mediator connections.
+    void stop();
+
+    // ── Group chat CRUD ───────────────────────────────────────────────────────
+
+    /// Create a new group chat (includes proof-of-work; may take a few seconds).
+    /// Returns the mediator-assigned chat ID.
+    [Throws=MimirError]
+    u64 create_chat(bytes mediator_pubkey, string name, string description, bytes? avatar);
+
+    [Throws=MimirError]
+    void delete_chat(bytes mediator_pubkey, u64 chat_id);
+
+    [Throws=MimirError]
+    void update_chat_info(bytes mediator_pubkey, u64 chat_id, string? name, string? description, bytes? avatar);
+
+    // ── Membership ────────────────────────────────────────────────────────────
+
+    [Throws=MimirError]
+    void add_user(bytes mediator_pubkey, u64 chat_id, bytes user_pubkey);
+
+    [Throws=MimirError]
+    void delete_user(bytes mediator_pubkey, u64 chat_id, bytes user_pubkey);
+
+    [Throws=MimirError]
+    void leave_chat(bytes mediator_pubkey, u64 chat_id);
+
+    /// Change a member's permission flags (ban, promote, demote).
+    [Throws=MimirError]
+    void change_member_status(bytes mediator_pubkey, u64 chat_id, bytes user_pubkey, u8 new_permissions);
+
+    // ── Messages ──────────────────────────────────────────────────────────────
+
+    /// Subscribe to push messages for `chat_id`.
+    /// Returns the server's last message ID.
+    [Throws=MimirError]
+    u64 subscribe(bytes mediator_pubkey, u64 chat_id);
+
+    /// Send an encrypted message blob.  Returns the server-assigned message ID.
+    [Throws=MimirError]
+    u64 send_group_message(bytes mediator_pubkey, u64 chat_id, u64 guid, u64 timestamp, bytes data);
+
+    [Throws=MimirError]
+    void delete_message(bytes mediator_pubkey, u64 chat_id, u64 message_id);
+
+    [Throws=MimirError]
+    u64 get_last_message_id(bytes mediator_pubkey, u64 chat_id);
+
+    [Throws=MimirError]
+    sequence<GroupMessage> get_messages_since(bytes mediator_pubkey, u64 chat_id, u64 since_id, u32 limit);
+
+    // ── Invites ───────────────────────────────────────────────────────────────
+
+    /// Send an invite to `recipient_pubkey`.
+    /// `encrypted_data` is the AES-encrypted shared key for the recipient.
+    [Throws=MimirError]
+    void send_invite(bytes mediator_pubkey, u64 chat_id, bytes recipient_pubkey, bytes encrypted_data);
+
+    [Throws=MimirError]
+    void respond_to_invite(bytes mediator_pubkey, u64 chat_id, u64 invite_id, boolean accept);
+
+    // ── Member info ───────────────────────────────────────────────────────────
+
+    /// Push our pre-encrypted profile blob to the mediator.
+    [Throws=MimirError]
+    void update_member_info(bytes mediator_pubkey, u64 chat_id, bytes encrypted_blob, u64 timestamp);
+
+    [Throws=MimirError]
+    sequence<GroupMemberInfo> get_members_info(bytes mediator_pubkey, u64 chat_id, u64 since_timestamp);
+
+    [Throws=MimirError]
+    sequence<GroupMember> get_members(bytes mediator_pubkey, u64 chat_id);
 };
