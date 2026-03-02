@@ -1,6 +1,7 @@
 //! P2P peer management — [`PeerNode`] is the main UniFFI-exported object.
 
 pub mod connection;
+pub mod data_stream;
 pub mod protocol;
 pub mod resolver;
 pub mod ygg_selector;
@@ -18,6 +19,8 @@ use ygg_stream::AsyncNode;
 
 use crate::{CallStatus, InfoProvider, MimirError, PeerEventListener};
 use connection::{ConnContext, OutgoingCmd, run_inbound, run_outbound};
+use data_stream::data_recv_task;
+use protocol::{read_exact, STREAM_ROLE_CONTROL, STREAM_ROLE_DATA};
 use resolver::Resolver;
 use ygg_selector::{YggSelector, run_selector};
 
@@ -74,6 +77,14 @@ impl PeerEventListener for EventWrapper {
     fn on_call_packet(&self, pubkey: Vec<u8>, data: Vec<u8>) {
         self.inner.on_call_packet(pubkey, data);
     }
+
+    fn on_file_receive_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_received: i64, total_bytes: i64) {
+        self.inner.on_file_receive_progress(pubkey, guid, bytes_received, total_bytes);
+    }
+
+    fn on_file_send_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_sent: i64, total_bytes: i64) {
+        self.inner.on_file_send_progress(pubkey, guid, bytes_sent, total_bytes);
+    }
 }
 
 // ── Shared runtime state ──────────────────────────────────────────────────────
@@ -88,6 +99,12 @@ struct PeerState {
     event_cb: Arc<dyn PeerEventListener>,
     info_cb: Arc<dyn InfoProvider>,
     resolver: Arc<Resolver>,
+    /// Maps ephemeral Yggdrasil routing key → permanent identity key.
+    /// Used by the data-stream accept path to identify incoming data streams.
+    eph_to_perm: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    /// Maps permanent peer key → control-stream write channel.
+    /// Shared with data_recv_task so it can ACK large files over the control stream.
+    ctrl_write_txs: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl PeerState {
@@ -98,6 +115,10 @@ impl PeerState {
             client_id: self.client_id,
             event_cb: Arc::clone(&self.event_cb),
             info_cb: Arc::clone(&self.info_cb),
+            node: Arc::clone(&self.node),
+            peer_port: self.peer_port,
+            eph_to_perm: Arc::clone(&self.eph_to_perm),
+            ctrl_write_txs: Arc::clone(&self.ctrl_write_txs),
         })
     }
 
@@ -242,6 +263,10 @@ impl PeerNode {
             our_eph_pubkey,
             &trackers,
         ));
+        let eph_to_perm: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let ctrl_write_txs: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let state = Arc::new(PeerState {
             our_pubkey,
             signing_key: Arc::clone(&sk),
@@ -252,9 +277,12 @@ impl PeerNode {
             event_cb: event_wrapper,
             info_cb: info_provider,
             resolver,
+            eph_to_perm,
+            ctrl_write_txs,
         });
 
         // Spawn the inbound-accept loop.
+        // Handles both control streams (role 0x00) and incoming data streams (role 0x01).
         {
             let state2 = Arc::clone(&state);
             let mut stop_rx = stop_tx.subscribe();
@@ -268,10 +296,50 @@ impl PeerNode {
                                 Ok(conn) => {
                                     let s = Arc::clone(&state2);
                                     tokio::spawn(async move {
-                                        let ctx  = s.make_ctx();
                                         let conn = Arc::new(conn);
-                                        if let Some((key, tx)) = run_inbound(conn, ctx).await {
-                                            s.register_peer(key, tx);
+                                        // Every new stream starts with a role byte.
+                                        let role = match read_exact(&conn, 1).await {
+                                            Ok(b) => b[0],
+                                            Err(e) => {
+                                                log::warn!("Accept: failed to read role byte: {}", e);
+                                                return;
+                                            }
+                                        };
+                                        match role {
+                                            STREAM_ROLE_CONTROL => {
+                                                let ctx = s.make_ctx();
+                                                if let Some((key, tx)) = run_inbound(conn, ctx).await {
+                                                    s.register_peer(key, tx);
+                                                }
+                                            }
+                                            STREAM_ROLE_DATA => {
+                                                // Identify the sender via the eph→perm map.
+                                                let peer_eph: [u8; 32] = match conn.public_key().try_into() {
+                                                    Ok(k) => k,
+                                                    Err(_) => {
+                                                        log::warn!("Accept data: unexpected eph key length");
+                                                        return;
+                                                    }
+                                                };
+                                                let perm_key = s.eph_to_perm
+                                                    .lock().unwrap()
+                                                    .get(&peer_eph)
+                                                    .copied();
+                                                match perm_key {
+                                                    Some(pk) => {
+                                                        let cb = Arc::clone(&s.event_cb);
+                                                        let txs = Arc::clone(&s.ctrl_write_txs);
+                                                        tokio::spawn(data_recv_task(conn, pk, cb, txs));
+                                                    }
+                                                    None => {
+                                                        log::warn!("Accept data: unknown eph key {}, dropping",
+                                                                   hex::encode(peer_eph));
+                                                    }
+                                                }
+                                            }
+                                            other => {
+                                                log::warn!("Accept: unknown stream role {:#04x}, dropping", other);
+                                            }
                                         }
                                     });
                                 }

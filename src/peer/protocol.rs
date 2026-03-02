@@ -33,6 +33,11 @@ pub const MSG_TYPE_OK: i32               = 32767;
 
 pub const PROTOCOL_VERSION: i32 = 1;
 
+/// Role byte written as the very first byte of every new stream.
+/// Tells the acceptor how to handle the stream.
+pub const STREAM_ROLE_CONTROL: u8 = 0x00;
+pub const STREAM_ROLE_DATA:    u8 = 0x01;
+
 /// Maximum avatar size we are willing to receive (50 KiB).
 const MAX_AVATAR_SIZE: usize = 50 * 1024;
 
@@ -76,7 +81,7 @@ pub struct CallOffer {
 // ── Low-level I/O helpers ─────────────────────────────────────────────────────
 
 /// Read exactly `n` bytes from the connection, blocking until done.
-async fn read_exact(conn: &AsyncConn, n: usize) -> Result<Vec<u8>, MimirError> {
+pub(crate) async fn read_exact(conn: &AsyncConn, n: usize) -> Result<Vec<u8>, MimirError> {
     let mut buf = vec![0u8; n];
     let mut pos = 0;
     while pos < n {
@@ -91,13 +96,13 @@ async fn read_exact(conn: &AsyncConn, n: usize) -> Result<Vec<u8>, MimirError> {
 }
 
 /// Read a big-endian i32.
-async fn read_i32(conn: &AsyncConn) -> Result<i32, MimirError> {
+pub(crate) async fn read_i32(conn: &AsyncConn) -> Result<i32, MimirError> {
     let b = read_exact(conn, 4).await?;
     Ok(i32::from_be_bytes(b.try_into().unwrap()))
 }
 
 /// Read a big-endian i64.
-async fn read_i64(conn: &AsyncConn) -> Result<i64, MimirError> {
+pub(crate) async fn read_i64(conn: &AsyncConn) -> Result<i64, MimirError> {
     let b = read_exact(conn, 8).await?;
     Ok(i64::from_be_bytes(b.try_into().unwrap()))
 }

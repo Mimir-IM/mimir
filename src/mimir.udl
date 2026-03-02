@@ -157,6 +157,14 @@ callback interface PeerEventListener {
     /// Passed through directly to the audio subsystem (stays in Kotlin/Swift
     /// until audio moves to Rust in a later phase).
     void on_call_packet(bytes pubkey, bytes data);
+
+    /// A large file/image is being received over the data stream.
+    /// Fired after each chunk; `bytes_received` increases until it equals `total_bytes`.
+    void on_file_receive_progress(bytes pubkey, i64 guid, i64 bytes_received, i64 total_bytes);
+
+    /// A large file/image is being sent over the data stream.
+    /// Fired after each chunk; `bytes_sent` increases until it equals `total_bytes`.
+    void on_file_send_progress(bytes pubkey, i64 guid, i64 bytes_sent, i64 total_bytes);
 };
 
 /// Receives mediator (group-chat server) events.

@@ -35,6 +35,8 @@ pub trait PeerEventListener: Send + Sync {
     fn on_incoming_call(&self, pubkey: Vec<u8>);
     fn on_call_status_changed(&self, status: CallStatus, pubkey: Option<Vec<u8>>);
     fn on_call_packet(&self, pubkey: Vec<u8>, data: Vec<u8>);
+    fn on_file_receive_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_received: i64, total_bytes: i64);
+    fn on_file_send_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_sent: i64, total_bytes: i64);
 }
 
 /// Receives mediator (group-chat server) events.

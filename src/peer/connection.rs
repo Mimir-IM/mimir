@@ -15,18 +15,27 @@
 //!   - If no meaningful activity occurs for 10 minutes the connection is
 //!     also closed.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use tokio::sync::mpsc;
-use ygg_stream::AsyncConn;
+use ygg_stream::{AsyncConn, AsyncNode};
 
 use crate::{
     CallStatus, ContactInfo, InfoProvider, MimirError, PeerEventListener,
 };
+use super::data_stream::encode_data_frame;
 use super::protocol::*;
+
+// ── Thresholds ────────────────────────────────────────────────────────────────
+
+/// Payloads larger than this are sent over the persistent data stream instead
+/// of the control stream, so that pings, pongs, and text messages are never
+/// blocked by a large file transfer.
+const FILE_STREAM_THRESHOLD: usize = 64 * 1024;
 
 // ── Timeouts / intervals ──────────────────────────────────────────────────────
 
@@ -68,6 +77,16 @@ pub struct ConnContext {
     pub client_id: i32,
     pub event_cb: Arc<dyn PeerEventListener>,
     pub info_cb: Arc<dyn InfoProvider>,
+    pub node: Arc<AsyncNode>,
+    pub peer_port: u16,
+    /// Maps ephemeral Yggdrasil routing key → permanent identity key.
+    /// Populated right after auth; removed when the message loop exits.
+    /// Used by the accept loop to identify the sender of incoming data streams.
+    pub eph_to_perm: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    /// Maps permanent peer key → control-stream write channel.
+    /// Allows data_recv_task to send MSG_TYPE_OK acknowledgements back over
+    /// the control stream after a large file is fully received.
+    pub ctrl_write_txs: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 // ── Entry points ──────────────────────────────────────────────────────────────
@@ -83,8 +102,44 @@ pub async fn run_inbound(conn: Arc<AsyncConn>, ctx: Arc<ConnContext>) -> Option<
 
     match auth_result {
         Ok(Ok(peer_key)) => {
+            // Peer's ephemeral Yggdrasil routing key (used to open/accept data streams).
+            let peer_eph: [u8; 32] = match conn.public_key().try_into() {
+                Ok(k) => k,
+                Err(_) => {
+                    log::warn!("Inbound: unexpected eph key length");
+                    return None;
+                }
+            };
+
+            // Register eph→perm before opening the data stream so the accept
+            // loop can identify us when our send-data stream arrives there.
+            ctx.eph_to_perm.lock().unwrap().insert(peer_eph, peer_key);
+
+            // Open our persistent send-data stream to this peer (same port,
+            // new stream on the same underlying Yggdrasil session).
+            let send_data_conn = match ctx.node.connect(&peer_eph, ctx.peer_port).await {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    log::warn!("Inbound: failed to open data stream to {}: {}",
+                               hex::encode(peer_key), e);
+                    ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
+                    return None;
+                }
+            };
+            // Mark this stream as a data stream.
+            if send_data_conn.write(&[STREAM_ROLE_DATA]).await.is_err() {
+                log::warn!("Inbound: failed to write data stream role byte");
+                ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
+                return None;
+            }
+
+            // Create the control-stream write channel here (before spawning)
+            // so data_recv_task can find it in ctrl_write_txs immediately.
+            let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            ctx.ctrl_write_txs.lock().unwrap().insert(peer_key, write_tx.clone());
+
             let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(message_loop(conn, peer_key, rx, ctx));
+            tokio::spawn(message_loop(conn, send_data_conn, peer_key, write_tx, write_rx, rx, ctx));
             Some((peer_key, tx))
         }
         Ok(Err(e)) => {
@@ -101,6 +156,13 @@ pub async fn run_inbound(conn: Arc<AsyncConn>, ctx: Arc<ConnContext>) -> Option<
 /// Drive an **outbound** connection to completion.
 /// Returns the outgoing-command sender on success.
 pub async fn run_outbound(conn: Arc<AsyncConn>, peer_key: [u8; 32], ctx: Arc<ConnContext>) -> Option<mpsc::UnboundedSender<OutgoingCmd>> {
+    // Write the control-stream role byte before the auth handshake.
+    // The inbound accept loop reads this first to distinguish control from data streams.
+    if conn.write(&[STREAM_ROLE_CONTROL]).await.is_err() {
+        log::warn!("Outbound: failed to write control role byte");
+        return None;
+    }
+
     let auth_result = tokio::time::timeout(
         AUTH_TIMEOUT,
         auth_outbound(&conn, &ctx, &peer_key),
@@ -109,8 +171,40 @@ pub async fn run_outbound(conn: Arc<AsyncConn>, peer_key: [u8; 32], ctx: Arc<Con
 
     match auth_result {
         Ok(Ok(())) => {
+            // Peer's ephemeral key = the routing key we used to connect.
+            let peer_eph: [u8; 32] = match conn.public_key().try_into() {
+                Ok(k) => k,
+                Err(_) => {
+                    log::warn!("Outbound: unexpected eph key length");
+                    return None;
+                }
+            };
+
+            // Register eph→perm before opening the data stream.
+            ctx.eph_to_perm.lock().unwrap().insert(peer_eph, peer_key);
+
+            // Open our persistent send-data stream (same port, new stream on
+            // the same underlying Yggdrasil session).
+            let send_data_conn = match ctx.node.connect(&peer_eph, ctx.peer_port).await {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    log::warn!("Outbound: failed to open data stream to {}: {}",
+                               hex::encode(peer_key), e);
+                    ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
+                    return None;
+                }
+            };
+            if send_data_conn.write(&[STREAM_ROLE_DATA]).await.is_err() {
+                log::warn!("Outbound: failed to write data stream role byte");
+                ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
+                return None;
+            }
+
+            let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            ctx.ctrl_write_txs.lock().unwrap().insert(peer_key, write_tx.clone());
+
             let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(message_loop(conn, peer_key, rx, ctx));
+            tokio::spawn(message_loop(conn, send_data_conn, peer_key, write_tx, write_rx, rx, ctx));
             Some(tx)
         }
         Ok(Err(e)) => {
@@ -242,8 +336,23 @@ async fn auth_outbound(conn: &AsyncConn, ctx: &ConnContext, peer_key: &[u8; 32])
 
 /// Post-auth message loop.  Runs until the connection dies or is explicitly
 /// closed.
-async fn message_loop(conn: Arc<AsyncConn>, peer_key: [u8; 32], mut cmd_rx: mpsc::UnboundedReceiver<OutgoingCmd>, ctx: Arc<ConnContext>) {
+async fn message_loop(
+    conn: Arc<AsyncConn>,
+    send_data_conn: Arc<AsyncConn>,
+    peer_key: [u8; 32],
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut cmd_rx: mpsc::UnboundedReceiver<OutgoingCmd>,
+    ctx: Arc<ConnContext>,
+) {
     let address = hex::encode(peer_key);
+
+    // Resolve the peer's ephemeral key (for eph_to_perm cleanup on exit).
+    // public_key() returns the stored key — safe to call even after close.
+    let peer_eph: [u8; 32] = conn.public_key()
+        .try_into()
+        .unwrap_or([0u8; 32]);
+
     ctx.event_cb.on_peer_connected(peer_key.to_vec(), address.clone());
 
     // Request peer's contact info once, right after auth.
@@ -252,13 +361,14 @@ async fn message_loop(conn: Arc<AsyncConn>, peer_key: [u8; 32], mut cmd_rx: mpsc
 
     // The reader sub-task owns a clone of conn for reading.
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<IncomingFrame>();
-    let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (data_write_tx, data_write_rx) = mpsc::unbounded_channel::<(i64, Vec<u8>)>();
 
     let read_conn = Arc::clone(&conn);
     let write_conn = Arc::clone(&conn);
 
     tokio::spawn(reader_task(read_conn, frame_tx));
     tokio::spawn(writer_task(write_conn, write_rx));
+    tokio::spawn(data_sender_task(Arc::clone(&send_data_conn), data_write_rx, peer_key, Arc::clone(&ctx.event_cb)));
 
     // Control state
     let mut call_status = CallStatus::Idle;
@@ -345,7 +455,7 @@ async fn message_loop(conn: Arc<AsyncConn>, peer_key: [u8; 32], mut cmd_rx: mpsc
                     }
                     Some(c) => {
                         if let Err(e) = handle_outgoing(
-                            c, &write_tx, &mut call_status,
+                            c, &write_tx, &data_write_tx, &mut call_status,
                             &ctx, &peer_key, &mut last_pong,
                         ).await {
                             log::error!("Error sending to {}: {}", &address, e);
@@ -365,6 +475,13 @@ async fn message_loop(conn: Arc<AsyncConn>, peer_key: [u8; 32], mut cmd_rx: mpsc
     }
 
     conn.close().await;
+    send_data_conn.close().await;
+
+    // Clean up per-peer maps now that this connection is gone.
+    if peer_eph != [0u8; 32] {
+        ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
+    }
+    ctx.ctrl_write_txs.lock().unwrap().remove(&peer_key);
 
     // Notify call hangup if a call was in progress.
     if !matches!(call_status, CallStatus::Idle) {
@@ -484,6 +601,7 @@ async fn handle_incoming(
 async fn handle_outgoing(
     cmd: OutgoingCmd,
     write_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    data_write_tx: &mpsc::UnboundedSender<(i64, Vec<u8>)>,
     call_status: &mut CallStatus,
     ctx: &ConnContext,
     peer_key: &[u8; 32],
@@ -491,10 +609,20 @@ async fn handle_outgoing(
 ) -> Result<(), MimirError> {
     match cmd {
         OutgoingCmd::Message { guid, reply_to, send_time, edit_time, msg_type, data } => {
-            let msg = P2pMessage { guid, reply_to, send_time, edit_time, msg_type, data };
-            let bytes = encode_message(&msg)?;
-            write_tx.send(bytes)
-                .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
+            if data.len() > FILE_STREAM_THRESHOLD {
+                // Large payload → send over the persistent data stream so that
+                // pings, pongs, and text messages on the control stream are
+                // never blocked by a large file transfer.
+                let frame = encode_data_frame(guid, reply_to, send_time, edit_time, msg_type, &data);
+                data_write_tx.send((guid, frame))
+                    .map_err(|_| MimirError::Io("data write channel closed".to_string()))?;
+            } else {
+                // Small payload → inline in the control stream frame as before.
+                let msg = P2pMessage { guid, reply_to, send_time, edit_time, msg_type, data };
+                let bytes = encode_message(&msg)?;
+                write_tx.send(bytes)
+                    .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
+            }
         }
 
         OutgoingCmd::StartCall => {
@@ -658,6 +786,42 @@ async fn writer_task(conn: Arc<AsyncConn>, mut rx: mpsc::UnboundedReceiver<Vec<u
         if let Err(e) = conn.write(&bytes).await {
             log::info!("Writer task: write failed ({})", e);
             break;
+        }
+    }
+}
+
+/// Runs in its own tokio task for the persistent data stream.
+/// Receives `(guid, full_frame)` items, writes the 44-byte header atomically,
+/// then streams the data payload in 64 KiB chunks while reporting send progress.
+async fn data_sender_task(
+    conn: Arc<AsyncConn>,
+    mut rx: mpsc::UnboundedReceiver<(i64, Vec<u8>)>,
+    peer_key: [u8; 32],
+    event_cb: Arc<dyn PeerEventListener>,
+) {
+    const HEADER_LEN: usize = 44; // 8+8+8+8+4+8
+    while let Some((guid, frame)) = rx.recv().await {
+        let total_data = frame.len().saturating_sub(HEADER_LEN);
+
+        // Write header
+        if conn.write(&frame[..HEADER_LEN]).await.is_err() {
+            break;
+        }
+
+        // Write data in 64 KiB chunks, reporting progress after each
+        let mut sent = 0;
+        while sent < total_data {
+            let end = (sent + 65536).min(total_data);
+            if conn.write(&frame[HEADER_LEN + sent..HEADER_LEN + end]).await.is_err() {
+                return;
+            }
+            sent = end;
+            event_cb.on_file_send_progress(
+                peer_key.to_vec(),
+                guid,
+                sent as i64,
+                total_data as i64,
+            );
         }
     }
 }
