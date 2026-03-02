@@ -24,6 +24,9 @@ curve25519-dalek = "4"
 hkdf             = "0.12"
 sha2             = "0.10"
 
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }
 

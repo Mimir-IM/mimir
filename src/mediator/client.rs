@@ -27,7 +27,7 @@ use super::protocol::*;
 // ── Timeouts ──────────────────────────────────────────────────────────────────
 
 /// Timeout for control/query operations (auth, ping, subscribe, get_*, …).
-const REQ_TIMEOUT:  Duration = Duration::from_secs(10);
+const REQ_TIMEOUT:  Duration = Duration::from_secs(15);
 /// Longer timeout for data-write operations (send_message) where the server
 /// may be busy but the request is genuinely processed — avoids false timeouts
 /// that leave messages marked unsent locally even though they were delivered.
@@ -399,6 +399,11 @@ impl MediatorClient {
     }
 
     /// Like `request()` but with a caller-specified timeout.
+    ///
+    /// The timeout covers both the write and the response wait so that a stalled
+    /// send on a slow Yggdrasil link does not block indefinitely.  The header and
+    /// payload are written as two separate calls under the same write mutex, avoiding
+    /// a full allocation of a combined frame for large payloads (e.g. images).
     async fn request_timed(&self, cmd: u8, payload: &[u8], timeout_dur: Duration) -> Result<Response, MimirError> {
         // Allocate req_id: u16, skip 0 (reserved for push).
         let raw = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -407,23 +412,26 @@ impl MediatorClient {
         let (tx, rx) = oneshot::channel::<Response>();
         self.pending.lock().await.insert(req_id, tx);
 
-        // Build and write the frame.
-        let frame = build_request_frame(cmd, req_id, payload);
-        {
-            let _guard = self.write_mu.lock().await;
-            self.conn.write(&frame).await
-                .map_err(|e| MimirError::Io(e))?;
-        }
-
-        // Await response with timeout.
-        match time::timeout(timeout_dur, rx).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(_))   => {
-                // Sender dropped (connection closed).
-                Err(MimirError::Connection("connection closed during request".into()))
+        // Write header + payload, then wait for response — all under one timeout.
+        let header = build_request_header(cmd, req_id, payload.len());
+        let result = time::timeout(timeout_dur, async {
+            {
+                let _guard = self.write_mu.lock().await;
+                self.conn.write(&header).await.map_err(|e| MimirError::Io(e))?;
+                self.conn.write(payload).await.map_err(|e| MimirError::Io(e))?;
             }
-            Err(_) => {
-                // Timeout — clean up pending.
+            rx.await.map_err(|_| MimirError::Connection("connection closed during request".into()))
+        }).await;
+
+        match result {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => {
+                self.pending.lock().await.remove(&req_id);
+                Err(e)
+            }
+            Err(_timeout) => {
+                // Connection is stalled — close it so reader/ping detect failure.
+                self.conn.close().await;
                 self.pending.lock().await.remove(&req_id);
                 Err(MimirError::Connection(format!(
                     "request cmd=0x{cmd:02x} timed out"

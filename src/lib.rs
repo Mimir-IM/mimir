@@ -12,4 +12,4 @@ pub use crypto::{decrypt_message, decrypt_shared_key, encrypt_message, encrypt_s
 pub use error::MimirError;
 pub use mediator::MediatorNode;
 pub use peer::PeerNode;
-pub use types::{CallStatus, ContactInfo, GroupMember, GroupMemberInfo, GroupMessage, MemberInfoData};
+pub use types::{CallStatus, ContactInfo, GroupMember, GroupMemberInfo, GroupMessage, MemberInfoData, YggPeerInfo};

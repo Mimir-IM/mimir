@@ -22,6 +22,20 @@ pub struct ContactInfo {
     pub update_time: i64,
 }
 
+// ── Yggdrasil peer info ───────────────────────────────────────────────────────
+
+/// Current active Yggdrasil router peer and its quality metrics.
+/// Returned by [`PeerNode::wait_for_peer_change`] for long-polling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YggPeerInfo {
+    /// URI of the currently active peer, or `None` if no peer is connected.
+    pub uri:      Option<String>,
+    /// Last measured Yggdrasil routing cost (lower = better). 0 if unknown.
+    pub cost:     u32,
+    /// Accumulated failure count for this peer.
+    pub failures: u32,
+}
+
 // ── Mediator types ────────────────────────────────────────────────────────────
 
 /// A group chat message returned by `get_messages_since`.

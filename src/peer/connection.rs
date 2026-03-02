@@ -30,8 +30,8 @@ use super::protocol::*;
 
 // ── Timeouts / intervals ──────────────────────────────────────────────────────
 
-const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
-const PING_INTERVAL: Duration = Duration::from_secs(60);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+const PING_INTERVAL: Duration = Duration::from_secs(50);
 const CALL_PING_INTERVAL: Duration = Duration::from_millis(2000);
 const PING_TIMEOUT: Duration = Duration::from_secs(7);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);      // 10 min — no call in progress

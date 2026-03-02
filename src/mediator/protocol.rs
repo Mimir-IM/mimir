@@ -282,6 +282,18 @@ pub fn build_request_frame(cmd: u8, req_id: u16, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Build just the 7-byte request header without copying the payload.
+///
+/// Use together with a separate `conn.write(payload)` under the same write
+/// mutex to avoid allocating a full copy of large payloads.
+pub fn build_request_header(cmd: u8, req_id: u16, payload_len: usize) -> [u8; 7] {
+    let mut h = [0u8; 7];
+    h[0] = cmd;
+    h[1..3].copy_from_slice(&req_id.to_be_bytes());
+    h[3..7].copy_from_slice(&(payload_len as u32).to_be_bytes());
+    h
+}
+
 // ── Frame reading (async) ─────────────────────────────────────────────────────
 
 pub struct Response {

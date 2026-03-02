@@ -3,12 +3,14 @@
 pub mod connection;
 pub mod protocol;
 pub mod resolver;
+pub mod ygg_selector;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ed25519_dalek::SigningKey;
+use rand::seq::SliceRandom;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
 use ygg_stream::AsyncNode;
@@ -17,6 +19,7 @@ use ygg_stream::AsyncNode;
 use crate::{CallStatus, InfoProvider, MimirError, PeerEventListener};
 use connection::{ConnContext, OutgoingCmd, run_inbound, run_outbound};
 use resolver::Resolver;
+use ygg_selector::{YggSelector, run_selector};
 
 // ── Peers map type alias ──────────────────────────────────────────────────────
 
@@ -148,6 +151,7 @@ pub struct PeerNode {
     announce_started: AtomicBool,
     /// Wakes the announce loop from its inter-announcement sleep immediately.
     announce_notify: Arc<tokio::sync::Notify>,
+    selector: Arc<YggSelector>,
 }
 
 impl PeerNode {
@@ -166,23 +170,58 @@ impl PeerNode {
         event_listener: Box<dyn PeerEventListener>,
         info_provider: Box<dyn InfoProvider>
     ) -> Result<Self, MimirError> {
+        #[cfg(target_os = "android")]
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Debug)
+                .with_tag("Mimir")
+                .with_filter(
+                    android_logger::FilterBuilder::new()
+                        .filter_module("ironwood", log::LevelFilter::Info)
+                        .filter_module("yggdrasil", log::LevelFilter::Info)
+                        .filter_module("ygg_stream", log::LevelFilter::Info)
+                        .filter(None, log::LevelFilter::Debug)
+                        .build(),
+                ),
+        );
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| MimirError::Connection(e.to_string()))?;
 
-        // Start the Yggdrasil node (async, so block on it here).
-        let node = rt
-            .block_on(AsyncNode::new_with_key(&signing_key, ygg_peers))
-            .map_err(|e| MimirError::Connection(e.to_string()))?;
-        let node = Arc::new(node);
+        // Pick one peer at random as the initial connection; the selector
+        // task takes over management after startup.  Handles empty lists too.
+        let selector = Arc::new(YggSelector::new(ygg_peers.clone()));
+        let initial_peers: Vec<String> = ygg_peers
+            .choose(&mut rand::thread_rng())
+            .cloned()
+            .into_iter()
+            .collect();
+        if let Some(uri) = initial_peers.first() {
+            *selector.active_uri.lock().unwrap() = Some(uri.clone());
+        }
 
-        // Derive signing key + our public key from the seed bytes.
+        // Derive permanent signing key + our identity pubkey from the seed bytes.
         let key_bytes: [u8; 32] = signing_key.try_into().map_err(|_| {
             MimirError::Connection("signing_key must be exactly 32 bytes".to_string())
         })?;
         let sk = SigningKey::from_bytes(&key_bytes);
         let our_pubkey = crate::crypto::pubkey_of(&sk);
+
+        // Generate a fresh ephemeral key pair for the Yggdrasil node so the
+        // routing address is not tied to the user's long-term identity key.
+        let ephemeral_seed: [u8; 32] = rand::random();
+
+        // Start the Yggdrasil node with the ephemeral key.
+        let node = rt
+            .block_on(AsyncNode::new_with_key(&ephemeral_seed, initial_peers))
+            .map_err(|e| MimirError::Connection(e.to_string()))?;
+        let node = Arc::new(node);
+
+        // The node's public key is our current Yggdrasil routing address.
+        let our_eph_pubkey: [u8; 32] = node.public_key().try_into()
+            .map_err(|_| MimirError::Connection("unexpected ygg pubkey length".into()))?;
 
         let (stop_tx, _) = broadcast::channel::<()>(1);
 
@@ -196,10 +235,11 @@ impl PeerNode {
             peers: Arc::clone(&peers),
         });
         let sk = Arc::new(sk);
+
         let resolver = Arc::new(Resolver::new(
             Arc::clone(&node),
             Arc::clone(&sk),
-            peer_port,
+            our_eph_pubkey,
             &trackers,
         ));
         let state = Arc::new(PeerState {
@@ -253,15 +293,17 @@ impl PeerNode {
             state.event_cb.on_connectivity_changed(true);
         }
 
-        // Spawn Yggdrasil peer-event monitor → fires on_connectivity_changed.
+        // Spawn Yggdrasil peer-event monitor → fires on_connectivity_changed
+        // and wakes the selector on every peer state change.
         //
         // On every event (including Lagged) we read the *actual* current peer
         // count rather than tracking a running delta.  This mirrors the
         // wait_peer_change pattern in ygg_stream and is immune to counter drift.
         {
-            let cb      = Arc::clone(&state.event_cb);
-            let node    = Arc::clone(&state.node);
-            let mut rx  = state.node.subscribe_peer_events();
+            let cb       = Arc::clone(&state.event_cb);
+            let node     = Arc::clone(&state.node);
+            let sel      = Arc::clone(&selector);
+            let mut rx   = state.node.subscribe_peer_events();
             let mut stop_rx = stop_tx.subscribe();
             rt.spawn(async move {
                 let mut is_online = initial_online;
@@ -277,6 +319,7 @@ impl PeerNode {
                                         is_online = now_online;
                                         cb.on_connectivity_changed(now_online);
                                     }
+                                    sel.notify.notify_one();
                                 }
                                 Err(broadcast::error::RecvError::Closed) => break,
                             }
@@ -286,18 +329,81 @@ impl PeerNode {
             });
         }
 
+        // Spawn the Yggdrasil peer selector task.
+        {
+            let sel     = Arc::clone(&selector);
+            let node    = Arc::clone(&state.node);
+            let stop_rx = stop_tx.subscribe();
+            rt.spawn(run_selector(sel, node, stop_rx));
+        }
+
         Ok(PeerNode {
             rt: Arc::new(rt),
             state,
             stop_tx,
             announce_started: AtomicBool::new(false),
             announce_notify: Arc::new(tokio::sync::Notify::new()),
+            selector,
         })
     }
 
     /// Our 32-byte Ed25519 public key (= Yggdrasil node identity).
     pub fn public_key(&self) -> Vec<u8> {
         self.state.our_pubkey.to_vec()
+    }
+
+    /// Replace the list of managed Yggdrasil router peers (priority = slice order).
+    ///
+    /// Metrics (failure count, cost) are preserved for URIs that remain in the
+    /// new list.  The selector will switch to the best available peer if the
+    /// current one is no longer listed.
+    pub fn set_ygg_peers(&self, peers: Vec<String>) {
+        self.selector.set_peers(peers);
+    }
+
+    /// Inform the selector whether the device has general internet connectivity.
+    ///
+    /// Call with `true` when the OS reports the network is up, `false` when
+    /// all interfaces go down.  While offline the selector suppresses peer
+    /// switching and lets Yggdrasil's own reconnect loop handle recovery.
+    pub fn set_network_online(&self, online: bool) {
+        self.selector.set_network_online(online);
+    }
+
+    /// Block until the active Yggdrasil peer info changes, then return it.
+    ///
+    /// If no change occurs within `timeout_ms` milliseconds the current state
+    /// is returned anyway.  Designed for a long-poll loop on the Kotlin side
+    /// to keep the notification bar up to date without busy-waiting.
+    pub fn wait_for_peer_info(&self, timeout_ms: u64) -> crate::YggPeerInfo {
+        let mut rx       = self.selector.subscribe_peer_info();
+        let node         = Arc::clone(&self.state.node);
+        let selector     = Arc::clone(&self.selector);
+        self.rt.block_on(async move {
+            // Mark current value as seen, then wait for a change or timeout.
+            rx.borrow_and_update();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                rx.changed(),
+            )
+            .await;
+
+            // If the app signaled that the network is down, report offline
+            // immediately — Yggdrasil's p.up may still be true while the TCP
+            // socket lingers, so we can't rely on it alone.
+            if !selector.is_network_online() {
+                return crate::YggPeerInfo { uri: None, cost: 0, failures: 0 };
+            }
+
+            // Query actual live peer state — uri is None when no peer is up.
+            match node.get_first_active_peer().await {
+                Some((uri, cost)) => {
+                    let failures = selector.failures_for(&uri);
+                    crate::YggPeerInfo { uri: Some(uri), cost: cost as u32, failures }
+                }
+                None => crate::YggPeerInfo { uri: None, cost: 0, failures: 0 },
+            }
+        })
     }
 
     /// Queue a message for delivery to the peer identified by `pubkey`.
@@ -423,6 +529,25 @@ impl PeerNode {
     /// Yggdrasil spanning-tree diagnostics, JSON-encoded.
     pub fn get_tree_json(&self) -> String {
         self.rt.block_on(self.state.node.get_tree_json())
+    }
+
+    /// Retry to connect to peers
+    pub fn retry_peers_now(&self) {
+        self.rt.block_on(self.state.node.retry_peers_now())
+    }
+
+    /// Add new peer to connect
+    pub fn add_peer(&self, uri: String) {
+        if let Err(e) = self.rt.block_on(self.state.node.add_peer(&uri)) {
+            eprintln!("[mimir] add_peer({:?}) failed: {}", uri, e);
+        }
+    }
+
+    /// Remove one of added peers
+    pub fn remove_peer(&self, uri: String) {
+        if let Err(e) = self.rt.block_on(self.state.node.remove_peer(&uri)) {
+            eprintln!("[mimir] remove_peer({:?}) failed: {}", uri, e);
+        }
     }
 
     /// Announce our current ephemeral Yggdrasil address to all configured trackers.

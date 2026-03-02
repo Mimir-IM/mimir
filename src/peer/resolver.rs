@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use ygg_stream::AsyncNode;
 
-use crate::crypto::{pubkey_of, sign, verify};
+use crate::crypto::{sign, verify};
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ const CMD_ANNOUNCE: u8 = 0x00;
 const CMD_GET_ADDRS: u8 = 0x01;
 
 /// How long to wait for a single tracker response.
-const RECV_TIMEOUT_MS: i64 = 3_000;
+const RECV_TIMEOUT_MS: i64 = 5_000;
 
 /// Maximum number of received datagrams to scan when matching a nonce
 /// (guards against stale/unrelated datagrams piling up).
@@ -50,8 +50,8 @@ const MAX_RECV_LOOPS: usize = 16;
 // ── Tracker address ───────────────────────────────────────────────────────────
 
 struct TrackerEntry {
-    pubkey:     [u8; 32],
-    port:       u16,
+    pubkey: [u8; 32],
+    port: u16,
     latency_ms: u64,   // updated by ping; used to pick the fastest tracker
 }
 
@@ -59,10 +59,10 @@ struct TrackerEntry {
 
 /// One cached ephemeral-key entry for a remote peer.
 pub struct CachedPeer {
-    pub ephemeral_key: [u8; 32],
-    pub priority:      u8,
-    pub client_id:     u32,
-    pub expires_at:    Instant,
+    pub addr: [u8; 32],
+    pub priority: u8,
+    pub client_id: u32,
+    pub expires_at: Instant,
 }
 
 // ── Resolver ──────────────────────────────────────────────────────────────────
@@ -70,9 +70,7 @@ pub struct CachedPeer {
 pub struct Resolver {
     node:       Arc<AsyncNode>,
     signing_key: Arc<SigningKey>,
-    our_pubkey: [u8; 32],
-    /// Port used to receive datagram responses from trackers.
-    listen_port: u16,
+    our_addr: [u8; 32],
     /// Tracker list (immutable after construction).
     trackers:   Vec<TrackerEntry>,
     /// permanent_pubkey → list of unexpired ephemeral addresses
@@ -85,18 +83,18 @@ pub struct Resolver {
 impl Resolver {
     /// Create a new Resolver.
     ///
-    /// * `listen_port`   – The port we receive tracker responses on (same port
-    ///                     used for peer stream connections is fine; streams and
-    ///                     datagrams are demultiplexed at the ygg_stream layer).
     /// * `tracker_strs`  – Tracker addresses in `"<hex32_pubkey>:<port>"` format.
-    pub fn new(node: Arc<AsyncNode>, signing_key: Arc<SigningKey>, listen_port: u16, tracker_strs: &[String]) -> Self {
-        let our_pubkey = pubkey_of(&signing_key);
-        let trackers   = tracker_strs.iter().filter_map(|s| parse_tracker(s)).collect();
+    pub fn new(
+        node: Arc<AsyncNode>,
+        signing_key: Arc<SigningKey>,
+        our_addr: [u8; 32],
+        tracker_strs: &[String],
+    ) -> Self {
+        let trackers = tracker_strs.iter().filter_map(|s| parse_tracker(s)).collect();
         Resolver {
             node,
             signing_key,
-            our_pubkey,
-            listen_port,
+            our_addr,
             trackers,
             cache:     Mutex::new(HashMap::new()),
             recv_lock: tokio::sync::Mutex::new(()),
@@ -116,7 +114,7 @@ impl Resolver {
                 let mut valid: Vec<&CachedPeer> =
                     entries.iter().filter(|p| p.expires_at > now).collect();
                 valid.sort_by(|a, b| b.priority.cmp(&a.priority));
-                valid.iter().map(|p| p.ephemeral_key).collect()
+                valid.iter().map(|p| p.addr).collect()
             }
         }
     }
@@ -145,7 +143,7 @@ impl Resolver {
                     let keys: Vec<[u8; 32]> = {
                         let mut sorted = peers.iter().collect::<Vec<_>>();
                         sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
-                        sorted.iter().map(|p| p.ephemeral_key).collect()
+                        sorted.iter().map(|p| p.addr).collect()
                     };
                     self.cache.lock().unwrap().insert(*permanent_pubkey, peers);
                     return keys;
@@ -179,8 +177,10 @@ impl Resolver {
         let _lock = self.recv_lock.lock().await;
 
         // Sign our ephemeral key with our permanent signing key.
-        let our_eph = self.our_pubkey;
-        let sig = sign(&self.signing_key, &our_eph);
+        let our_addr = self.our_addr;
+        let sig = sign(&self.signing_key, &our_addr);
+        let public_key  = self.signing_key.verifying_key().to_bytes();
+        log::info!("Announcing addr {} from {}", hex::encode(&our_addr[..8]), hex::encode(&public_key));
 
         // Build announce frame:
         // [VERSION:1][nonce:4][CMD_ANNOUNCE:1]
@@ -190,19 +190,23 @@ impl Resolver {
         frame.push(VERSION);
         frame.extend_from_slice(&nonce);
         frame.push(CMD_ANNOUNCE);
-        frame.extend_from_slice(&self.our_pubkey);  // permanent pubkey
-        frame.push(1u8);                            // priority
+        frame.extend_from_slice(&public_key);          // permanent pubkey
+        frame.push(1u8);                        // priority
         frame.extend_from_slice(&1u32.to_be_bytes()); // client_id = 1
-        frame.extend_from_slice(&our_eph);          // ephemeral addr
+        frame.extend_from_slice(&our_addr);           // ephemeral addr
         frame.extend_from_slice(&sig);
 
         for tracker in &self.trackers {
+            // Pre-register listener on tracker.port before sending so we don't miss
+            // the response (tracker responds on the same port it listens on).
+            let _ = self.node.recv_datagram_with_timeout(tracker.port, 1).await;
+
             if let Err(e) = self.node.send_datagram(&tracker.pubkey, tracker.port, &frame).await {
                 log::warn!("resolver: announce send to {} failed: {e}", hex::encode(&tracker.pubkey[..4]));
                 continue;
             }
             // Best-effort read of TTL response (not required for correctness).
-            match self.recv_matching(&tracker.pubkey, &nonce, CMD_ANNOUNCE).await {
+            match self.recv_matching(&tracker.pubkey, &nonce, CMD_ANNOUNCE, tracker.port).await {
                 Ok(payload) if payload.len() >= 8 => {
                     let ttl = i64::from_be_bytes(payload[..8].try_into().unwrap());
                     log::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
@@ -229,12 +233,17 @@ impl Resolver {
         frame.push(CMD_GET_ADDRS);
         frame.extend_from_slice(permanent_pubkey);
 
+        // Pre-register listener on tracker.port before sending so we don't miss
+        // the response. The tracker has no source-port concept and responds on
+        // the same port it listens on (tracker.port).
+        let _ = self.node.recv_datagram_with_timeout(tracker.port, 1).await;
+
         let t0 = Instant::now();
         self.node
             .send_datagram(&tracker.pubkey, tracker.port, &frame)
             .await?;
 
-        let payload = self.recv_matching(&tracker.pubkey, &nonce, CMD_GET_ADDRS).await?;
+        let payload = self.recv_matching(&tracker.pubkey, &nonce, CMD_GET_ADDRS, tracker.port).await?;
         let rtt_ms = t0.elapsed().as_millis() as u64;
         log::debug!("resolver: tracker {} RTT = {rtt_ms}ms", hex::encode(&tracker.pubkey[..4]));
 
@@ -243,22 +252,36 @@ impl Resolver {
 
     /// Wait for a datagram from `expected_sender` whose payload starts with
     /// `[nonce:4][cmd:1]`.  Returns the payload after those 5 bytes.
-    async fn recv_matching(&self, expected_sender: &[u8; 32], nonce: &[u8; 4], cmd: u8) -> Result<Vec<u8>, String> {
+    async fn recv_matching(&self, expected_sender: &[u8; 32], nonce: &[u8; 4], cmd: u8, port: u16) -> Result<Vec<u8>, String> {
         for _ in 0..MAX_RECV_LOOPS {
             let (data, sender) = self.node
-                .recv_datagram_with_timeout(self.listen_port, RECV_TIMEOUT_MS)
-                .await?;
+                .recv_datagram_with_timeout(port, RECV_TIMEOUT_MS)
+                .await
+                .map_err(|e| {
+                    log::warn!(
+                        "resolver: recv_matching timed out waiting for cmd=0x{:02x} from {}",
+                        cmd, hex::encode(&expected_sender[..4])
+                    );
+                    e
+                })?;
 
             if sender.len() != 32 || sender.as_slice() != expected_sender.as_slice() {
-                continue; // datagram from someone else — discard
+                log::debug!(
+                    "resolver: recv_matching: datagram from unexpected sender {}, discarding",
+                    hex::encode(&sender[..sender.len().min(4)])
+                );
+                continue;
             }
             if data.len() < 5 {
+                log::debug!("resolver: recv_matching: datagram too short ({} bytes)", data.len());
                 continue;
             }
             if data[0..4] != *nonce {
-                continue; // stale nonce from a previous request
+                log::debug!("resolver: recv_matching: nonce mismatch, discarding stale datagram");
+                continue;
             }
             if data[4] != cmd {
+                log::debug!("resolver: recv_matching: cmd mismatch (got 0x{:02x}, want 0x{:02x})", data[4], cmd);
                 continue;
             }
             return Ok(data[5..].to_vec());
@@ -311,7 +334,7 @@ fn parse_get_addrs_response(payload: &[u8], permanent_pubkey: &[u8; 32]) -> Resu
         }
 
         peers.push(CachedPeer {
-            ephemeral_key: eph_key,
+            addr: eph_key,
             priority,
             client_id,
             expires_at: now + Duration::from_secs(ttl_secs),
@@ -380,7 +403,8 @@ mod tests {
                 .await
                 .expect("AsyncNode::new_with_key failed"),
         );
-        Resolver::new(node, Arc::new(sk), 7777, &[])
+        let eph_addr: [u8; 32] = node.public_key().try_into().unwrap();
+        Resolver::new(node, Arc::new(sk), eph_addr, &[])
     }
 
     // ── parse_tracker ─────────────────────────────────────────────────────────
@@ -440,13 +464,13 @@ mod tests {
     #[test]
     fn parse_get_addrs_valid_single_record() {
         let sk            = random_sk();
-        let permanent_pk  = pubkey_of(&sk);
+        let permanent_pk  = sk.verifying_key().to_bytes();
         let eph_key       = [7u8; 32];
         let payload = build_get_addrs_payload(&sk, &[(eph_key, 5, 42, 300)]);
 
         let peers = parse_get_addrs_response(&payload, &permanent_pk).unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].ephemeral_key, eph_key);
+        assert_eq!(peers[0].addr, eph_key);
         assert_eq!(peers[0].priority, 5);
         assert_eq!(peers[0].client_id, 42);
         // TTL was 300 s; expires_at should be in the future
@@ -456,7 +480,7 @@ mod tests {
     #[test]
     fn parse_get_addrs_multiple_records() {
         let sk           = random_sk();
-        let permanent_pk = pubkey_of(&sk);
+        let permanent_pk = sk.verifying_key().to_bytes();
         let peers_in = [
             ([1u8; 32], 10u8, 1u32, 600u64),
             ([2u8; 32], 5,    2,    300),
@@ -471,7 +495,7 @@ mod tests {
     fn parse_get_addrs_bad_signature_is_skipped() {
         let sk            = random_sk();
         let attacker_sk   = random_sk();
-        let permanent_pk  = pubkey_of(&sk);
+        let permanent_pk  = sk.verifying_key().to_bytes();
         let eph_key       = [0xABu8; 32];
 
         // Signed by the wrong key — should fail verification and be skipped.
@@ -504,7 +528,7 @@ mod tests {
         let ephemeral_key = [2u8; 32];
 
         resolver.cache.lock().unwrap().insert(permanent_key, vec![CachedPeer {
-            ephemeral_key,
+            addr: ephemeral_key,
             priority:   1,
             client_id:  1,
             expires_at: Instant::now() + Duration::from_secs(300),
@@ -523,13 +547,13 @@ mod tests {
 
         resolver.cache.lock().unwrap().insert(permanent_key, vec![
             CachedPeer {
-                ephemeral_key: live_key,
+                addr: live_key,
                 priority:   1,
                 client_id:  1,
                 expires_at: Instant::now() + Duration::from_secs(300),
             },
             CachedPeer {
-                ephemeral_key: dead_key,
+                addr: dead_key,
                 priority:   2,
                 client_id:  2,
                 // Already expired — subtract from now to guarantee past.
@@ -548,9 +572,9 @@ mod tests {
         let future        = Instant::now() + Duration::from_secs(300);
 
         resolver.cache.lock().unwrap().insert(permanent_key, vec![
-            CachedPeer { ephemeral_key: [1u8; 32], priority: 3, client_id: 1, expires_at: future },
-            CachedPeer { ephemeral_key: [2u8; 32], priority: 7, client_id: 2, expires_at: future },
-            CachedPeer { ephemeral_key: [3u8; 32], priority: 1, client_id: 3, expires_at: future },
+            CachedPeer { addr: [1u8; 32], priority: 3, client_id: 1, expires_at: future },
+            CachedPeer { addr: [2u8; 32], priority: 7, client_id: 2, expires_at: future },
+            CachedPeer { addr: [3u8; 32], priority: 1, client_id: 3, expires_at: future },
         ]);
 
         let result = resolver.get_cached(&permanent_key);

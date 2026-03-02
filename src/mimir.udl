@@ -86,6 +86,14 @@ dictionary MemberInfoData {
     i64    timestamp;
 };
 
+/// Active Yggdrasil router peer and its quality metrics.
+/// Returned by PeerNode.wait_for_peer_info.
+dictionary YggPeerInfo {
+    string? uri;       // null if no peer is currently active
+    u32     cost;      // last measured routing cost (lower = better), 0 if unknown
+    u32     failures;  // accumulated failure count for this peer
+};
+
 // ── Callback interfaces (implemented by Kotlin/Swift) ─────────────────────────
 
 /// Provides local user info and stores contact info received from peers.
@@ -247,6 +255,19 @@ interface PeerNode {
     /// Our 32-byte Ed25519 public key (= Yggdrasil identity).
     bytes public_key();
 
+    /// Replace the list of managed Yggdrasil router peers (priority = slice order).
+    /// Metrics are preserved for URIs that remain in the new list.
+    void set_ygg_peers(sequence<string> peers);
+
+    /// Inform the selector whether the device has general internet connectivity.
+    /// false → suppress peer switching, let Yggdrasil reconnect on its own.
+    void set_network_online(boolean online);
+
+    /// Block until the active Yggdrasil peer info changes, then return it.
+    /// Returns the current state if no change occurs within timeout_ms milliseconds.
+    /// Designed for a long-poll loop to keep the notification bar up to date.
+    YggPeerInfo wait_for_peer_info(u64 timeout_ms);
+
     /// Announce our current ephemeral Yggdrasil address to all configured trackers.
     ///
     /// Returns immediately; I/O is done in the background.
@@ -303,6 +324,15 @@ interface PeerNode {
 
     /// Yggdrasil spanning-tree diagnostics, JSON-encoded.
     string get_tree_json();
+
+    /// Yggdrasil spanning-tree diagnostics, JSON-encoded.
+    void retry_peers_now();
+
+    /// Add new peer to connect
+    void add_peer(string uri);
+
+    /// Remove one of added peers
+    void remove_peer(string uri);
 
     /// Stop the node and close all connections.
     void stop();
