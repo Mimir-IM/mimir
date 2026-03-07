@@ -257,11 +257,12 @@ impl MediatorClient {
     }
 
     /// Returns `(message_id, guid)`.
+    /// `timestamp` must be milliseconds since epoch; it is converted to seconds before sending.
     pub async fn send_message(&self, chat_id: i64, guid: i64, timestamp: i64, data: &[u8]) -> Result<(i64, i64), MimirError> {
         let mut p = Vec::new();
         write_tlv_i64(&mut p, TAG_CHAT_ID,      chat_id);
         write_tlv_i64(&mut p, TAG_MESSAGE_GUID,  guid);
-        write_tlv_i64(&mut p, TAG_TIMESTAMP,     timestamp);
+        write_tlv_i64(&mut p, TAG_TIMESTAMP,     timestamp / 1000); // ms → seconds
         write_tlv(&mut p,     TAG_MESSAGE_BLOB,  data);
         let resp = self.request_timed(CMD_SEND_MESSAGE, &p, SEND_TIMEOUT).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("sendMessage")); }
@@ -271,10 +272,10 @@ impl MediatorClient {
         Ok((msg_id, new_guid))
     }
 
-    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), MimirError> {
+    pub async fn delete_message(&self, chat_id: i64, guid: i64) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_i64(&mut p, TAG_CHAT_ID,    chat_id);
-        write_tlv_i64(&mut p, TAG_MESSAGE_ID, message_id);
+        write_tlv_i64(&mut p, TAG_CHAT_ID, chat_id);
+        write_tlv_i64(&mut p, TAG_MESSAGE_GUID, guid);
         let resp = self.request(CMD_DELETE_MESSAGE, &p).await?;
         if resp.status != STATUS_OK { return Err(resp.into_error("deleteMessage")); }
         Ok(())
@@ -309,9 +310,8 @@ impl MediatorClient {
         Ok(())
     }
 
-    pub async fn respond_to_invite(&self, chat_id: i64, invite_id: i64, accept: bool) -> Result<(), MimirError> {
+    pub async fn respond_to_invite(&self, _chat_id: i64, invite_id: i64, accept: bool) -> Result<(), MimirError> {
         let mut p = Vec::new();
-        write_tlv_i64(&mut p, TAG_CHAT_ID,   chat_id);
         write_tlv_i64(&mut p, TAG_INVITE_ID, invite_id);
         write_tlv_u8(&mut p,  TAG_ACCEPTED,  accept as u8);
         let resp = self.request(CMD_INVITE_RESPONSE, &p).await?;
@@ -400,38 +400,68 @@ impl MediatorClient {
 
     /// Like `request()` but with a caller-specified timeout.
     ///
-    /// The timeout covers both the write and the response wait so that a stalled
-    /// send on a slow Yggdrasil link does not block indefinitely.  The header and
-    /// payload are written as two separate calls under the same write mutex, avoiding
-    /// a full allocation of a combined frame for large payloads (e.g. images).
+    /// Two-phase approach:
+    /// - **Write phase**: each 64 KB chunk gets its own `CHUNK_TIMEOUT` deadline so
+    ///   large payloads (images) can be sent without hitting `timeout_dur`.
+    ///   `last_activity_ms` is updated after every successful chunk.
+    /// - **Response-wait phase**: `timeout_dur` applies only after the full payload
+    ///   has been written, covering just the server processing + response RTT.
     async fn request_timed(&self, cmd: u8, payload: &[u8], timeout_dur: Duration) -> Result<Response, MimirError> {
-        // Allocate req_id: u16, skip 0 (reserved for push).
+        // Allocate req_id: u16, skip 0.
         let raw = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req_id = ((raw % 0xFFFF) as u16) + 1; // range 1..=65535
 
         let (tx, rx) = oneshot::channel::<Response>();
         self.pending.lock().await.insert(req_id, tx);
 
-        // Write header + payload, then wait for response — all under one timeout.
-        let header = build_request_header(cmd, req_id, payload.len());
-        let result = time::timeout(timeout_dur, async {
-            {
-                let _guard = self.write_mu.lock().await;
-                self.conn.write(&header).await.map_err(|e| MimirError::Io(e))?;
-                self.conn.write(payload).await.map_err(|e| MimirError::Io(e))?;
-            }
-            rx.await.map_err(|_| MimirError::Connection("connection closed during request".into()))
-        }).await;
+        // Phase 1: write header + payload.
+        // Each chunk has its own CHUNK_TIMEOUT so we don't starve on slow links
+        // while still bounding how long a single chunk can stall.
+        const CHUNK: usize = 64 * 1024;
+        const CHUNK_TIMEOUT: Duration = Duration::from_secs(10);
 
-        match result {
+        let header = build_request_header(cmd, req_id, payload.len());
+        let write_err: Option<MimirError> = async {
+            let _guard = self.write_mu.lock().await;
+            if let Err(e) = self.conn.write(&header).await {
+                return Some(MimirError::Io(e));
+            }
+            let mut offset = 0;
+            while offset < payload.len() {
+                let end = (offset + CHUNK).min(payload.len());
+                match time::timeout(CHUNK_TIMEOUT, self.conn.write(&payload[offset..end])).await {
+                    Ok(Ok(_))  => {}
+                    Ok(Err(e)) => return Some(MimirError::Io(e)),
+                    Err(_)     => return Some(MimirError::Connection(
+                        format!("request cmd=0x{cmd:02x}: chunk write timed out")
+                    )),
+                }
+                self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+                offset = end;
+            }
+            None
+        }.await;
+
+        if let Some(e) = write_err {
+            // RST: immediately sets stream state=Closed and wakes the reader
+            // task, so reader_loop exits and fires on_disconnected promptly.
+            self.conn.abort().await;
+            self.pending.lock().await.remove(&req_id);
+            return Err(e);
+        }
+
+        // Phase 2: wait for the server's response within timeout_dur.
+        match time::timeout(timeout_dur, rx).await {
             Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => {
+            Ok(Err(_)) => {
                 self.pending.lock().await.remove(&req_id);
-                Err(e)
+                Err(MimirError::Connection("connection closed during request".into()))
             }
             Err(_timeout) => {
-                // Connection is stalled — close it so reader/ping detect failure.
-                self.conn.close().await;
+                // RST instead of graceful FIN: poll_read only unblocks on
+                // Closed, not Closing, so a FIN-based close leaves the reader
+                // task stuck forever and on_disconnected never fires.
+                self.conn.abort().await;
                 self.pending.lock().await.remove(&req_id);
                 Err(MimirError::Connection(format!(
                     "request cmd=0x{cmd:02x} timed out"
@@ -444,7 +474,10 @@ impl MediatorClient {
 
     async fn reader_loop(&self, listener: &dyn MediatorEventListener) {
         loop {
-            let resp = match read_response(&self.conn).await {
+            // last_activity_ms is updated inside read_response after every
+            // partial read, so the ping loop sees the connection as alive
+            // throughout large response payloads.
+            let resp = match read_response(&self.conn, &self.last_activity_ms).await {
                 Ok(r)  => r,
                 Err(e) => {
                     log::error!("mediator reader error: {e}");
@@ -456,29 +489,26 @@ impl MediatorClient {
                 }
             };
 
-            self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
-
-            // Dispatch push messages by their special req_id values.
-            if resp.status == STATUS_OK {
+            // Dispatch server-initiated pushes (STATUS_PUSH).
+            if resp.status == STATUS_PUSH {
                 match resp.req_id as u16 {
                     PUSH_GOT_MESSAGE => {
                         self.handle_push_message(resp.payload, listener);
-                        continue;
                     }
                     PUSH_GOT_INVITE => {
                         self.handle_push_invite(resp.payload, listener);
-                        continue;
                     }
                     PUSH_REQUEST_MEMBER_INFO => {
                         self.handle_member_info_request(resp.payload, listener).await;
-                        continue;
                     }
                     PUSH_GOT_MEMBER_INFO => {
                         self.handle_member_info_update(resp.payload, listener);
-                        continue;
                     }
-                    _ => {}
+                    other => {
+                        log::warn!("mediator: unknown push cmd=0x{other:04x}");
+                    }
                 }
+                continue;
             }
 
             // Normal response: complete the waiting oneshot.
@@ -543,7 +573,7 @@ impl MediatorClient {
         let avatar     = tlvs.opt_bytes(TAG_CHAT_AVATAR);
         let enc_data   = tlvs.opt_bytes(TAG_INVITE_DATA).unwrap_or_default();
 
-        listener.on_push_invite(invite_id, chat_id, from, timestamp, name, desc, avatar, enc_data);
+        listener.on_push_invite(invite_id, chat_id, from, timestamp, name, desc, avatar, enc_data, self.mediator_pubkey.to_vec());
     }
 
     async fn handle_member_info_request(&self,payload:  Vec<u8>, listener: &dyn MediatorEventListener) {
@@ -576,7 +606,7 @@ impl MediatorClient {
         };
         let chat_id       = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
         let member_pubkey = tlvs.opt_bytes(TAG_USER_PUBKEY).unwrap_or_default();
-        let encrypted     = tlvs.opt_bytes(TAG_MEMBER_INFO);
+        let encrypted     = tlvs.opt_bytes(TAG_MEMBER_INFO).filter(|v| !v.is_empty());
         let timestamp     = tlvs.get_i64(TAG_TIMESTAMP).unwrap_or(0);
 
         listener.on_member_info_update(chat_id, member_pubkey, encrypted, timestamp);
@@ -747,7 +777,9 @@ fn parse_members_info_list(payload: &[u8]) -> Result<Vec<GroupMemberInfo>, Mimir
                 if pubkey.is_some() { flush!(); }
                 pubkey = Some(value.to_vec());
             }
-            TAG_MEMBER_INFO => { enc_info  = Some(value.to_vec()); }
+            TAG_MEMBER_INFO => {
+                if !value.is_empty() { enc_info = Some(value.to_vec()); }
+            }
             TAG_TIMESTAMP   => {
                 if value.len() == 8 {
                     timestamp = Some(i64::from_be_bytes(value.try_into().unwrap()));

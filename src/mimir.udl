@@ -165,6 +165,11 @@ callback interface PeerEventListener {
     /// A large file/image is being sent over the data stream.
     /// Fired after each chunk; `bytes_sent` increases until it equals `total_bytes`.
     void on_file_send_progress(bytes pubkey, i64 guid, i64 bytes_sent, i64 total_bytes);
+
+    /// Tracker announce completed.
+    /// `ok` = true if at least one tracker accepted the announce.
+    /// `ttl` = TTL in seconds returned by the tracker (0 on failure).
+    void on_tracker_announce(boolean ok, i32 ttl);
 };
 
 /// Receives mediator (group-chat server) events.
@@ -175,6 +180,12 @@ callback interface PeerEventListener {
 callback interface MediatorEventListener {
     /// Authenticated connection established to this mediator.
     void on_connected(bytes mediator_pubkey);
+
+    /// Subscription to `chat_id` confirmed.
+    /// `last_message_id` is the highest message ID on the mediator for this chat.
+    /// If it exceeds your local last ID, call `get_messages_since` to catch up.
+    /// For a first-time join use `since_id = 0` to fetch the full history.
+    void on_subscribed(bytes mediator_pubkey, i64 chat_id, i64 last_message_id);
 
     /// An encrypted group chat message arrived from the mediator push.
     void on_push_message(
@@ -198,6 +209,7 @@ callback interface MediatorEventListener {
 
     /// A group chat invitation arrived.
     /// `encrypted_data` is the AES-wrapped shared key for the recipient.
+    /// `mediator_pubkey` identifies which mediator delivered this invite.
     void on_push_invite(
         i64     invite_id,
         i64     chat_id,
@@ -206,7 +218,8 @@ callback interface MediatorEventListener {
         string  chat_name,
         string  chat_desc,
         bytes?  chat_avatar,
-        bytes   encrypted_data
+        bytes   encrypted_data,
+        bytes   mediator_pubkey
     );
 
     /// Mediator asks us to (re-)send our encrypted member profile.
@@ -410,11 +423,15 @@ interface MediatorNode {
     i64 subscribe(bytes mediator_pubkey, i64 chat_id);
 
     /// Send an encrypted message blob.  Returns the server-assigned message ID.
+    /// `timestamp` must be milliseconds since epoch (e.g. System.currentTimeMillis()).
+    /// Rust converts it to seconds internally before sending.
     [Throws=MimirError]
     i64 send_group_message(bytes mediator_pubkey, i64 chat_id, i64 guid, i64 timestamp, bytes data);
 
+    /// Delete a message.  `guid` is the client-generated GUID originally passed to
+    /// send_group_message — NOT the server-assigned message_id returned by it.
     [Throws=MimirError]
-    void delete_message(bytes mediator_pubkey, i64 chat_id, i64 message_id);
+    void delete_message(bytes mediator_pubkey, i64 chat_id, i64 guid);
 
     [Throws=MimirError]
     i64 get_last_message_id(bytes mediator_pubkey, i64 chat_id);

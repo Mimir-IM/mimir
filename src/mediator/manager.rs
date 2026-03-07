@@ -114,12 +114,6 @@ impl MediatorManager {
             Err(e) => log::warn!("mediator {}: get_user_chats failed: {e}", &hex[..8]),
         }
 
-        for chat_id in chat_ids {
-            if let Err(e) = client.subscribe(chat_id).await {
-                log::warn!("mediator {}: auto-subscribe chat {chat_id} failed: {e}", &hex[..8]);
-            }
-        }
-
         // Insert atomically while checking that the connection hasn't already died.
         {
             let mut map = self.clients.lock().unwrap();
@@ -135,8 +129,21 @@ impl MediatorManager {
         // Reset reconnect counter on successful connection.
         self.attempts.lock().unwrap().remove(hex);
 
-        // Notify the app that the connection is fully ready (all chats subscribed).
+        // Notify the app FIRST — client is in the map so any mimir call from the
+        // callback hits the fast path in get_or_create (no key-lock contention).
+        // The app's onConnected handler typically subscribes to all its known chats,
+        // which fires on_subscribed once per chat with the correct last_message_id.
         self.listener.on_connected(mediator_pubkey.to_vec());
+
+        // Silently re-subscribe as a safety net (idempotent on the server).
+        // We do NOT fire on_subscribed here — the app's onConnected already called
+        // subscribe() for each chat, which fires on_subscribed with proper context.
+        // Firing it again here would cause double syncMissedMessages runs.
+        for chat_id in chat_ids {
+            if let Err(e) = client.subscribe(chat_id).await {
+                log::warn!("mediator {}: auto-subscribe chat {chat_id} failed: {e}", &hex[..8]);
+            }
+        }
 
         Ok(client)
     }
@@ -209,6 +216,11 @@ impl MediatorManager {
         });
     }
 
+    /// Fire `on_subscribed` on the user listener (used by `MediatorNode::subscribe`).
+    pub fn fire_subscribed(&self, mediator_pubkey: &[u8; 32], chat_id: i64, last_message_id: i64) {
+        self.listener.on_subscribed(mediator_pubkey.to_vec(), chat_id, last_message_id);
+    }
+
     /// Retrieve a live client (returns None if not connected).
     pub fn get(&self, mediator_pubkey: &[u8; 32]) -> Option<MediatorClient> {
         let hex = hex::encode(mediator_pubkey);
@@ -242,6 +254,10 @@ impl MediatorEventListener for ReconnectListener {
         self.inner.on_connected(mediator_pubkey);
     }
 
+    fn on_subscribed(&self, mediator_pubkey: Vec<u8>, chat_id: i64, last_message_id: i64) {
+        self.inner.on_subscribed(mediator_pubkey, chat_id, last_message_id);
+    }
+
     fn on_push_message(
         &self, chat_id: i64, message_id: i64, guid: i64,
         timestamp: i64, author: Vec<u8>, data: Vec<u8>,
@@ -259,11 +275,11 @@ impl MediatorEventListener for ReconnectListener {
     fn on_push_invite(
         &self, invite_id: i64, chat_id: i64, from_pubkey: Vec<u8>,
         timestamp: i64, chat_name: String, chat_desc: String,
-        chat_avatar: Option<Vec<u8>>, encrypted_data: Vec<u8>,
+        chat_avatar: Option<Vec<u8>>, encrypted_data: Vec<u8>, mediator_pubkey: Vec<u8>,
     ) {
         self.inner.on_push_invite(
             invite_id, chat_id, from_pubkey, timestamp,
-            chat_name, chat_desc, chat_avatar, encrypted_data,
+            chat_name, chat_desc, chat_avatar, encrypted_data, mediator_pubkey,
         );
     }
 

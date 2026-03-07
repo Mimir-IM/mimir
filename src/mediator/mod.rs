@@ -155,6 +155,7 @@ impl MediatorNode {
 
     /// Subscribe to push messages for `chat_id`.
     /// Returns the server's last message ID (use to fetch missed messages).
+    /// Also fires `on_subscribed` so the caller can fetch history asynchronously.
     /// The subscription is persisted locally so it is restored on reconnect.
     pub fn subscribe(&self, mediator_pubkey: Vec<u8>, chat_id: i64) -> Result<i64, MimirError> {
         let key = to_key32(&mediator_pubkey)?;
@@ -163,6 +164,7 @@ impl MediatorNode {
             let client = self.manager.get_or_create(&key).await?;
             let last_id = client.subscribe(chat_id).await?;
             self.manager.remember_subscription(&hex, chat_id);
+            self.manager.fire_subscribed(&key, chat_id, last_id);
             Ok(last_id)
         })
     }
@@ -177,11 +179,11 @@ impl MediatorNode {
         })
     }
 
-    pub fn delete_message(&self, mediator_pubkey: Vec<u8>, chat_id: i64, message_id: i64) -> Result<(), MimirError> {
+    pub fn delete_message(&self, mediator_pubkey: Vec<u8>, chat_id: i64, guid: i64) -> Result<(), MimirError> {
         let key = to_key32(&mediator_pubkey)?;
         self.rt.block_on(async move {
             let client = self.manager.get_or_create(&key).await?;
-            client.delete_message(chat_id, message_id).await
+            client.delete_message(chat_id, guid).await
         })
     }
 

@@ -85,6 +85,10 @@ impl PeerEventListener for EventWrapper {
     fn on_file_send_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_sent: i64, total_bytes: i64) {
         self.inner.on_file_send_progress(pubkey, guid, bytes_sent, total_bytes);
     }
+
+    fn on_tracker_announce(&self, ok: bool, ttl: i32) {
+        self.inner.on_tracker_announce(ok, ttl);
+    }
 }
 
 // ── Shared runtime state ──────────────────────────────────────────────────────
@@ -634,13 +638,20 @@ impl PeerNode {
         let node = self.ygg_node().clone();
         let notify = Arc::clone(&self.announce_notify);
         let mut stop_rx = self.stop_tx.subscribe();
+        let event_cb = Arc::clone(&self.state.event_cb);
         self.rt.spawn(async move {
             let pause = Duration::from_secs(60);
             loop {
                 let delay = if node.count_active_peers().await > 0 {
                     match resolver.announce().await {
-                        Ok(ttl) => Duration::from_secs(ttl as u64),
-                        Err(_)  => pause,
+                        Ok(ttl) => {
+                            event_cb.on_tracker_announce(true, ttl as i32);
+                            Duration::from_secs(ttl as u64)
+                        }
+                        Err(_) => {
+                            event_cb.on_tracker_announce(false, 0);
+                            pause
+                        }
                     }
                 } else {
                     pause

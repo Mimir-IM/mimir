@@ -37,6 +37,10 @@ pub trait PeerEventListener: Send + Sync {
     fn on_call_packet(&self, pubkey: Vec<u8>, data: Vec<u8>);
     fn on_file_receive_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_received: i64, total_bytes: i64);
     fn on_file_send_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_sent: i64, total_bytes: i64);
+    /// Tracker announce completed.
+    /// `ok` = true if at least one tracker accepted the announce.
+    /// `ttl` = TTL in seconds returned by the tracker (0 on failure).
+    fn on_tracker_announce(&self, ok: bool, ttl: i32);
 }
 
 /// Receives mediator (group-chat server) events.
@@ -47,6 +51,14 @@ pub trait PeerEventListener: Send + Sync {
 pub trait MediatorEventListener: Send + Sync {
     /// Authenticated connection to this mediator established.
     fn on_connected(&self, mediator_pubkey: Vec<u8>);
+
+    /// Subscription to `chat_id` confirmed.  `last_message_id` is the highest
+    /// message ID currently stored on the mediator for this chat.
+    ///
+    /// Use this to detect missed messages: if `last_message_id` exceeds your
+    /// locally stored last ID, call `get_messages_since` to catch up.
+    /// For a fresh join pass `since_id = 0` to retrieve the full history.
+    fn on_subscribed(&self, mediator_pubkey: Vec<u8>, chat_id: i64, last_message_id: i64);
 
     /// A group chat message arrived (data is the encrypted blob from the sender).
     fn on_push_message(
@@ -80,6 +92,7 @@ pub trait MediatorEventListener: Send + Sync {
         chat_desc: String,
         chat_avatar: Option<Vec<u8>>,
         encrypted_data: Vec<u8>,
+        mediator_pubkey: Vec<u8>,
     );
 
     /// Mediator is asking us to (re-)send our member profile for a chat.

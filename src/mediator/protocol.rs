@@ -11,6 +11,7 @@
 //! `reqId` value that matches one of the PUSH_* constants below.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ygg_stream::AsyncConn;
 
@@ -21,8 +22,9 @@ use crate::MimirError;
 pub const VERSION:      u8 = 0x01;
 pub const PROTO_CLIENT: u8 = 0x00;
 
-pub const STATUS_OK:  u8 = 0x00;
-pub const STATUS_ERR: u8 = 0x01;
+pub const STATUS_OK:   u8 = 0x00;
+pub const STATUS_ERR:  u8 = 0x01;
+pub const STATUS_PUSH: u8 = 0x02;
 
 // ── Command codes (client → server) ──────────────────────────────────────────
 
@@ -321,7 +323,9 @@ impl Response {
 }
 
 /// Read exactly `buf.len()` bytes from `conn`, looping over partial reads.
-async fn read_exact(conn: &AsyncConn, buf: &mut [u8]) -> Result<(), MimirError> {
+/// Updates `activity` with the current timestamp after every successful read
+/// so the caller's ping loop sees the connection as alive during large reads.
+async fn read_exact(conn: &AsyncConn, buf: &mut [u8], activity: &AtomicU64) -> Result<(), MimirError> {
     let mut filled = 0;
     while filled < buf.len() {
         let n = conn.read(&mut buf[filled..]).await
@@ -330,16 +334,25 @@ async fn read_exact(conn: &AsyncConn, buf: &mut [u8]) -> Result<(), MimirError> 
             return Err(MimirError::Io("connection closed (EOF)".into()));
         }
         filled += n;
+        activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            Ordering::Relaxed,
+        );
     }
     Ok(())
 }
 
 /// Read one response frame from the connection.
 /// Returns an error on I/O failure or if the payload is unreasonably large.
-pub async fn read_response(conn: &AsyncConn) -> Result<Response, MimirError> {
+/// `activity` is updated after every partial read so the ping loop does not
+/// fire while a large response payload is being received.
+pub async fn read_response(conn: &AsyncConn, activity: &AtomicU64) -> Result<Response, MimirError> {
     // header: [status:1][reqId:2][payloadLen:4]
     let mut hdr = [0u8; 7];
-    read_exact(conn, &mut hdr).await?;
+    read_exact(conn, &mut hdr, activity).await?;
 
     let status  = hdr[0];
     let req_id  = u16::from_be_bytes([hdr[1], hdr[2]]);
@@ -354,7 +367,7 @@ pub async fn read_response(conn: &AsyncConn) -> Result<Response, MimirError> {
 
     let mut payload = vec![0u8; pay_len];
     if pay_len > 0 {
-        read_exact(conn, &mut payload).await?;
+        read_exact(conn, &mut payload, activity).await?;
     }
 
     Ok(Response { status, req_id, payload })
