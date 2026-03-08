@@ -29,6 +29,8 @@ pub const MSG_TYPE_CALL_OFFER: i32       = 2000;
 pub const MSG_TYPE_CALL_ANSWER: i32      = 2001;
 pub const MSG_TYPE_CALL_HANG: i32        = 2002;
 pub const MSG_TYPE_CALL_PACKET: i32      = 2003;
+pub const MSG_TYPE_CONTACT_REQUEST: i32  = 3000;
+pub const MSG_TYPE_CONTACT_RESPONSE: i32 = 3001;
 pub const MSG_TYPE_OK: i32               = 32767;
 
 pub const PROTOCOL_VERSION: i32 = 1;
@@ -76,6 +78,13 @@ pub struct CallOffer {
     pub mime_type:     String,
     pub sample_rate:   i32,
     pub channel_count: i32,
+}
+
+pub struct ContactRequest {
+    pub message:  String,
+    pub nickname: String,
+    pub info:     String,
+    pub avatar:   Option<Vec<u8>>,
 }
 
 // ── Low-level I/O helpers ─────────────────────────────────────────────────────
@@ -469,6 +478,70 @@ pub async fn write_call_packet(conn: &AsyncConn, data: &[u8]) -> Result<(), Mimi
     buf.extend_from_slice(data);
     conn.write(&buf).await.map_err(|e| MimirError::Io(e))?;
     Ok(())
+}
+
+// ── Contact request / response ───────────────────────────────────────────────
+
+/// Read a CONTACT_REQUEST payload (header consumed).
+/// Wire: [msg_len(4)][msg][nick_len(4)][nick][info_len(4)][info][avatar_len(4)][avatar]
+pub async fn read_contact_request(conn: &AsyncConn) -> Result<ContactRequest, MimirError> {
+    let msg_bytes = read_blob_i32(conn).await?;
+    let message = String::from_utf8(msg_bytes)
+        .map_err(|e| MimirError::Protocol(e.to_string()))?;
+
+    let nick_bytes = read_blob_i32(conn).await?;
+    let nickname = String::from_utf8(nick_bytes)
+        .map_err(|e| MimirError::Protocol(e.to_string()))?;
+
+    let info_bytes = read_blob_i32(conn).await?;
+    let info = String::from_utf8(info_bytes)
+        .map_err(|e| MimirError::Protocol(e.to_string()))?;
+
+    let avatar_len = read_i32(conn).await? as usize;
+    let avatar = if avatar_len == 0 {
+        None
+    } else if avatar_len <= MAX_AVATAR_SIZE {
+        Some(read_exact(conn, avatar_len).await?)
+    } else {
+        discard(conn, avatar_len).await?;
+        None
+    };
+
+    Ok(ContactRequest { message, nickname, info, avatar })
+}
+
+pub fn encode_contact_request(req: &ContactRequest) -> Result<Vec<u8>, MimirError> {
+    let msg  = req.message.as_bytes();
+    let nick = req.nickname.as_bytes();
+    let inf  = req.info.as_bytes();
+    let av   = req.avatar.as_deref().unwrap_or(&[]);
+
+    let payload_len = 4 + msg.len() + 4 + nick.len() + 4 + inf.len() + 4 + av.len();
+
+    let mut buf = Vec::with_capacity(16 + payload_len);
+    buf.extend_from_slice(&build_header(MSG_TYPE_CONTACT_REQUEST, payload_len as i64));
+    buf.extend_from_slice(&(msg.len() as i32).to_be_bytes());
+    buf.extend_from_slice(msg);
+    buf.extend_from_slice(&(nick.len() as i32).to_be_bytes());
+    buf.extend_from_slice(nick);
+    buf.extend_from_slice(&(inf.len() as i32).to_be_bytes());
+    buf.extend_from_slice(inf);
+    buf.extend_from_slice(&(av.len() as i32).to_be_bytes());
+    buf.extend_from_slice(av);
+    Ok(buf)
+}
+
+/// Read a CONTACT_RESPONSE payload (header consumed). Returns `accepted`.
+pub async fn read_contact_response(conn: &AsyncConn) -> Result<bool, MimirError> {
+    let b = read_exact(conn, 1).await?;
+    Ok(b[0] != 0)
+}
+
+pub fn encode_contact_response(accepted: bool) -> Result<Vec<u8>, MimirError> {
+    let mut buf = Vec::with_capacity(16 + 1);
+    buf.extend_from_slice(&build_header(MSG_TYPE_CONTACT_RESPONSE, 1));
+    buf.push(if accepted { 1 } else { 0 });
+    Ok(buf)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

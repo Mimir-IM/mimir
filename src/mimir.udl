@@ -113,6 +113,11 @@ callback interface InfoProvider {
     /// Return the directory path where file attachments are stored.
     /// Used when a received message includes a file payload to be saved.
     string get_files_dir();
+
+    /// Return permission flags for a peer.
+    /// 0 = unknown/stranger (only contact requests allowed),
+    /// 1 = contact (full messaging allowed).
+    i32 get_peer_flags(bytes pubkey);
 };
 
 /// Receives P2P networking events. All callbacks are invoked from Rust
@@ -165,6 +170,19 @@ callback interface PeerEventListener {
     /// A large file/image is being sent over the data stream.
     /// Fired after each chunk; `bytes_sent` increases until it equals `total_bytes`.
     void on_file_send_progress(bytes pubkey, i64 guid, i64 bytes_sent, i64 total_bytes);
+
+    /// A contact (friend) request arrived from a peer.
+    /// Includes the sender's profile info so it can be displayed in the UI.
+    void on_contact_request(
+        bytes    pubkey,
+        string   message,
+        string   nickname,
+        string   info,
+        bytes?   avatar
+    );
+
+    /// A contact response arrived (accepted or rejected our request).
+    void on_contact_response(bytes pubkey, boolean accepted);
 
     /// Tracker announce completed.
     /// `ok` = true if at least one tracker accepted the announce.
@@ -317,6 +335,15 @@ interface PeerNode {
     /// Returns immediately; on_peer_connected fires when auth completes.
     [Throws=MimirError]
     void connect_to_peer(bytes pubkey);
+
+    /// Send a contact (friend) request to `pubkey` with an introductory message.
+    /// The sender's profile info is automatically attached.
+    [Throws=MimirError]
+    void send_contact_request(bytes pubkey, string message);
+
+    /// Send a contact response (accept/reject) to `pubkey`.
+    [Throws=MimirError]
+    void send_contact_response(bytes pubkey, boolean accepted);
 
     /// Close the connection to `pubkey` (if any).
     void disconnect_peer(bytes pubkey);

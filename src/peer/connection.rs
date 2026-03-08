@@ -62,6 +62,8 @@ pub enum OutgoingCmd {
     AnswerCall(bool),
     HangupCall,
     CallPacket(Vec<u8>),
+    ContactRequest { message: String },
+    ContactResponse { accepted: bool },
     Disconnect,
     /// Sent by register_peer when a newer connection replaces this one.
     /// Causes the loop to exit cleanly WITHOUT firing the HANGUP callback,
@@ -355,9 +357,14 @@ async fn message_loop(
 
     ctx.event_cb.on_peer_connected(peer_key.to_vec(), address.clone());
 
-    // Request peer's contact info once, right after auth.
-    let since = ctx.info_cb.get_contact_update_time(peer_key.to_vec());
-    let _ = write_info_request(&conn, since as i64).await;
+    // Check permission flags for this peer.
+    let mut peer_flags = ctx.info_cb.get_peer_flags(peer_key.to_vec());
+
+    // Request peer's contact info once, right after auth — only if allowed.
+    if peer_flags > 0 {
+        let since = ctx.info_cb.get_contact_update_time(peer_key.to_vec());
+        let _ = write_info_request(&conn, since as i64).await;
+    }
 
     // The reader sub-task owns a clone of conn for reading.
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<IncomingFrame>();
@@ -429,7 +436,7 @@ async fn message_loop(
                             last_activity = Instant::now();
                         }
                         if let Err(e) = handle_incoming(
-                            f, &peer_key, &ctx, &write_tx, &mut call_status, &mut last_pong,
+                            f, &peer_key, &ctx, &write_tx, &mut call_status, &mut last_pong, &mut peer_flags,
                         ).await {
                             log::error!("Error handling frame from {}: {}", &address, e);
                             break 'main;
@@ -493,6 +500,9 @@ async fn message_loop(
 // ── Incoming frame handling ───────────────────────────────────────────────────
 
 /// Dispatch a fully-parsed incoming frame.
+///
+/// `peer_flags` is re-queried after contact request/response events so that
+/// permission changes take effect immediately on the live connection.
 async fn handle_incoming(
     frame: IncomingFrame,
     peer_key: &[u8; 32],
@@ -500,6 +510,7 @@ async fn handle_incoming(
     write_tx: &mpsc::UnboundedSender<Vec<u8>>,
     call_status: &mut CallStatus,
     last_pong: &mut Instant,
+    peer_flags: &mut i32,
 ) -> Result<(), MimirError> {
     match frame {
         IncomingFrame::Ping => {
@@ -512,6 +523,10 @@ async fn handle_incoming(
         }
 
         IncomingFrame::Message(msg) => {
+            if *peer_flags <= 0 {
+                log::debug!("Dropping message from non-contact {}", hex::encode(peer_key));
+                return Ok(());
+            }
             // Acknowledge receipt.
             let ok = build_ok_frame(msg.guid);
             write_tx.send(ok)
@@ -535,6 +550,10 @@ async fn handle_incoming(
         }
 
         IncomingFrame::InfoRequest(since) => {
+            if *peer_flags <= 0 {
+                log::debug!("Ignoring info request from non-contact {}", hex::encode(peer_key));
+                return Ok(());
+            }
             let info = ctx.info_cb.get_my_info(since);
             if let Some(i) = info {
                 let resp = InfoResponse {
@@ -543,7 +562,6 @@ async fn handle_incoming(
                     info: i.info,
                     avatar: i.avatar,
                 };
-                // Serialize and queue the write.
                 let bytes = encode_info_response(&resp)?;
                 write_tx.send(bytes)
                     .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
@@ -551,6 +569,10 @@ async fn handle_incoming(
         }
 
         IncomingFrame::InfoResponse(r) => {
+            if *peer_flags <= 0 {
+                log::debug!("Ignoring info response from non-contact {}", hex::encode(peer_key));
+                return Ok(());
+            }
             ctx.info_cb.update_contact_info(peer_key.to_vec(), ContactInfo {
                 nickname: r.nickname,
                 info: r.info,
@@ -559,10 +581,31 @@ async fn handle_incoming(
             });
         }
 
+        IncomingFrame::ContactRequest(req) => {
+            ctx.event_cb.on_contact_request(
+                peer_key.to_vec(),
+                req.message,
+                req.nickname,
+                req.info,
+                req.avatar,
+            );
+            // Re-query flags in case the app auto-accepts or creates the contact.
+            *peer_flags = ctx.info_cb.get_peer_flags(peer_key.to_vec());
+        }
+
+        IncomingFrame::ContactResponse(accepted) => {
+            ctx.event_cb.on_contact_response(peer_key.to_vec(), accepted);
+            // Re-query flags — if accepted, the app will have created the contact.
+            *peer_flags = ctx.info_cb.get_peer_flags(peer_key.to_vec());
+        }
+
         IncomingFrame::CallOffer(_offer) => {
+            if *peer_flags <= 0 {
+                log::debug!("Dropping call offer from non-contact {}", hex::encode(peer_key));
+                return Ok(());
+            }
             if matches!(*call_status, CallStatus::Idle) {
                 *call_status = CallStatus::Receiving;
-                // Reset so CALL_IDLE_TIMEOUT counts from when the call arrives.
                 *last_pong = Instant::now();
                 ctx.event_cb.on_incoming_call(peer_key.to_vec());
             }
@@ -623,6 +666,25 @@ async fn handle_outgoing(
                 write_tx.send(bytes)
                     .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
             }
+        }
+
+        OutgoingCmd::ContactRequest { message } => {
+            // Build the contact request with our own info.
+            let my_info = ctx.info_cb.get_my_info(0);
+            let (nickname, info, avatar) = match my_info {
+                Some(ci) => (ci.nickname, ci.info, ci.avatar),
+                None => (String::new(), String::new(), None),
+            };
+            let req = super::protocol::ContactRequest { message, nickname, info, avatar };
+            let bytes = encode_contact_request(&req)?;
+            write_tx.send(bytes)
+                .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
+        }
+
+        OutgoingCmd::ContactResponse { accepted } => {
+            let bytes = encode_contact_response(accepted)?;
+            write_tx.send(bytes)
+                .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
         }
 
         OutgoingCmd::StartCall => {
@@ -696,6 +758,8 @@ pub enum IncomingFrame {
     CallAnswer(bool, String),
     CallHangup,
     CallPacket(Vec<u8>),
+    ContactRequest(super::protocol::ContactRequest),
+    ContactResponse(bool),
     Ok(i64),
     Unknown(i32, i64),
 }
@@ -759,6 +823,16 @@ async fn read_one_frame(conn: &AsyncConn) -> Result<IncomingFrame, MimirError> {
         }
 
         MSG_TYPE_CALL_HANG => IncomingFrame::CallHangup,
+
+        MSG_TYPE_CONTACT_REQUEST => {
+            let req = read_contact_request(conn).await?;
+            IncomingFrame::ContactRequest(req)
+        }
+
+        MSG_TYPE_CONTACT_RESPONSE => {
+            let accepted = read_contact_response(conn).await?;
+            IncomingFrame::ContactResponse(accepted)
+        }
 
         MSG_TYPE_CALL_PACKET => {
             let data = read_call_packet(conn).await?;

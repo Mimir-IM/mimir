@@ -86,6 +86,14 @@ impl PeerEventListener for EventWrapper {
         self.inner.on_file_send_progress(pubkey, guid, bytes_sent, total_bytes);
     }
 
+    fn on_contact_request(&self, pubkey: Vec<u8>, message: String, nickname: String, info: String, avatar: Option<Vec<u8>>) {
+        self.inner.on_contact_request(pubkey, message, nickname, info, avatar);
+    }
+
+    fn on_contact_response(&self, pubkey: Vec<u8>, accepted: bool) {
+        self.inner.on_contact_response(pubkey, accepted);
+    }
+
     fn on_tracker_announce(&self, ok: bool, ttl: i32) {
         self.inner.on_tracker_announce(ok, ttl);
     }
@@ -555,6 +563,18 @@ impl PeerNode {
             log::error!("connect_to_peer {}: all addresses exhausted", hex::encode(&key[..4]));
         });
         Ok(())
+    }
+
+    /// Send a contact (friend) request to `pubkey` with an introductory message.
+    pub fn send_contact_request(&self, pubkey: Vec<u8>, message: String) -> Result<(), MimirError> {
+        let key = vec_to_key(&pubkey)?;
+        self.state.send_cmd(&key, OutgoingCmd::ContactRequest { message })
+    }
+
+    /// Send a contact response (accept/reject) to `pubkey`.
+    pub fn send_contact_response(&self, pubkey: Vec<u8>, accepted: bool) -> Result<(), MimirError> {
+        let key = vec_to_key(&pubkey)?;
+        self.state.send_cmd(&key, OutgoingCmd::ContactResponse { accepted })
     }
 
     /// Close the connection to `pubkey` (if any).

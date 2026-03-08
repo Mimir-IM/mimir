@@ -11,6 +11,10 @@ pub trait InfoProvider: Send + Sync {
     fn update_contact_info(&self, pubkey: Vec<u8>, info: ContactInfo);
     /// Return the directory path where file attachments are stored.
     fn get_files_dir(&self) -> String;
+    /// Return permission flags for a peer.
+    /// 0 = unknown/stranger (only contact requests allowed),
+    /// 1 = contact (full messaging allowed).
+    fn get_peer_flags(&self, pubkey: Vec<u8>) -> i32;
 }
 
 /// Receives P2P networking events. All callbacks are invoked from Rust
@@ -37,6 +41,10 @@ pub trait PeerEventListener: Send + Sync {
     fn on_call_packet(&self, pubkey: Vec<u8>, data: Vec<u8>);
     fn on_file_receive_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_received: i64, total_bytes: i64);
     fn on_file_send_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_sent: i64, total_bytes: i64);
+    /// A contact request arrived from a peer.
+    fn on_contact_request(&self, pubkey: Vec<u8>, message: String, nickname: String, info: String, avatar: Option<Vec<u8>>);
+    /// A contact response arrived (accepted or rejected).
+    fn on_contact_response(&self, pubkey: Vec<u8>, accepted: bool);
     /// Tracker announce completed.
     /// `ok` = true if at least one tracker accepted the announce.
     /// `ttl` = TTL in seconds returned by the tracker (0 on failure).
