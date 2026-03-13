@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use ygg_stream::AsyncConn;
 
 use crate::PeerEventListener;
-use super::protocol::{build_header, read_exact, read_i32, read_i64, MSG_TYPE_OK};
+use super::protocol::{build_header, read_exact, read_i32, read_i64, MSG_TYPE_OK, MSG_TYPE_FILE_RESPONSE};
 
 /// Encode a single file transfer frame for the persistent data stream.
 pub fn encode_data_frame(
@@ -56,6 +56,7 @@ pub async fn data_recv_task(
     peer_key: [u8; 32],
     event_cb: Arc<dyn PeerEventListener>,
     ctrl_write_txs: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>>,
+    pending_file_sizes: Arc<Mutex<HashMap<String, i64>>>,
 ) {
     let address = hex::encode(peer_key);
     loop {
@@ -63,34 +64,63 @@ pub async fn data_recv_task(
         let guid = match read_i64(&conn).await {
             Ok(v) => v,
             Err(e) => {
-                log::info!("Data recv from {}: stream closed ({})", &address, e);
+                tracing::info!("Data recv from {}: stream closed ({})", &address, e);
                 break;
             }
         };
         let reply_to = match read_i64(&conn).await {
             Ok(v) => v,
-            Err(e) => { log::info!("Data recv from {}: ({})", &address, e); break; }
+            Err(e) => { tracing::info!("Data recv from {}: ({})", &address, e); break; }
         };
         let send_time = match read_i64(&conn).await {
             Ok(v) => v,
-            Err(e) => { log::info!("Data recv from {}: ({})", &address, e); break; }
+            Err(e) => { tracing::info!("Data recv from {}: ({})", &address, e); break; }
         };
         let edit_time = match read_i64(&conn).await {
             Ok(v) => v,
-            Err(e) => { log::info!("Data recv from {}: ({})", &address, e); break; }
+            Err(e) => { tracing::info!("Data recv from {}: ({})", &address, e); break; }
         };
         let msg_type = match read_i32(&conn).await {
             Ok(v) => v,
-            Err(e) => { log::info!("Data recv from {}: ({})", &address, e); break; }
+            Err(e) => { tracing::info!("Data recv from {}: ({})", &address, e); break; }
         };
         let data_size = match read_i64(&conn).await {
             Ok(v) => v,
-            Err(e) => { log::info!("Data recv from {}: ({})", &address, e); break; }
+            Err(e) => { tracing::info!("Data recv from {}: ({})", &address, e); break; }
         };
 
         if data_size < 0 || data_size > 512 * 1024 * 1024 {
-            log::warn!("Data recv from {}: implausible data_size {}", &address, data_size);
+            tracing::warn!("Data recv from {}: implausible data_size {}", &address, data_size);
             break;
+        }
+
+        // ── For FILE_RESPONSE, check against declared size from original request ──
+        if msg_type == MSG_TYPE_FILE_RESPONSE {
+            // Read the meta JSON prefix to extract the filename, then look up
+            // the expected size we stored when we sent the FILE_REQUEST.
+            // The meta prefix is tiny (well under 1 KiB) and is part of data_size,
+            // so reading 4 bytes for meta-length + meta JSON is safe.
+            // However, we only know data_size at this point — we haven't read any
+            // data bytes yet. We can check data_size against the expected file size
+            // plus a generous overhead for the JSON metadata (4 KiB should be plenty).
+            //
+            // We can't extract the filename without reading data, so we check ALL
+            // pending requests: if data_size exceeds the largest pending expected
+            // size + overhead, it's definitely bogus.
+            // Overhead: 4 bytes (meta length prefix) + ~150 bytes (meta JSON).
+            const META_OVERHEAD: i64 = 256;
+            if let Ok(map) = pending_file_sizes.lock() {
+                if !map.is_empty() {
+                    let max_expected = map.values().copied().max().unwrap_or(0);
+                    if max_expected > 0 && data_size > max_expected + META_OVERHEAD {
+                        tracing::warn!(
+                            "Data recv from {}: FILE_RESPONSE size {} exceeds max expected {} + overhead, aborting stream",
+                            &address, data_size, max_expected
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         // ── Read data in 64 KiB chunks, reporting progress ─────────────────
@@ -110,8 +140,34 @@ pub async fn data_recv_task(
                     );
                 }
                 Err(e) => {
-                    log::info!("Data recv from {}: read error ({})", &address, e);
+                    tracing::info!("Data recv from {}: read error ({})", &address, e);
                     return;
+                }
+            }
+        }
+
+        // ── For FILE_RESPONSE, verify exact size against the pending request ──
+        if msg_type == MSG_TYPE_FILE_RESPONSE && data.len() >= 4 {
+            // Parse meta JSON to get filename and check exact size.
+            let meta_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if data.len() >= 4 + meta_len {
+                if let Ok(meta_str) = std::str::from_utf8(&data[4..4 + meta_len]) {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                        if let Some(name) = meta.get("name").and_then(|v| v.as_str()) {
+                            let file_bytes_len = (data.len() - 4 - meta_len) as i64;
+                            let expected = pending_file_sizes.lock().ok()
+                                .and_then(|mut map| map.remove(name));
+                            if let Some(expected_size) = expected {
+                                if expected_size > 0 && file_bytes_len != expected_size {
+                                    tracing::warn!(
+                                        "Data recv from {}: FILE_RESPONSE for '{}' actual size {} != declared {}, discarding",
+                                        &address, name, file_bytes_len, expected_size
+                                    );
+                                    continue; // skip delivery, proceed to next frame
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -137,7 +193,7 @@ pub async fn data_recv_task(
             if let Some(tx) = map.get(&peer_key) {
                 let _ = tx.send(ok_frame);
             } else {
-                log::warn!("Data recv from {}: no control write channel for ACK", &address);
+                tracing::warn!("Data recv from {}: no control write channel for ACK", &address);
             }
         }
     }

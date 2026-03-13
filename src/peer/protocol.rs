@@ -31,6 +31,8 @@ pub const MSG_TYPE_CALL_HANG: i32        = 2002;
 pub const MSG_TYPE_CALL_PACKET: i32      = 2003;
 pub const MSG_TYPE_CONTACT_REQUEST: i32  = 3000;
 pub const MSG_TYPE_CONTACT_RESPONSE: i32 = 3001;
+pub const MSG_TYPE_FILE_REQUEST: i32     = 4000;
+pub const MSG_TYPE_FILE_RESPONSE: i32    = 4001;
 pub const MSG_TYPE_OK: i32               = 32767;
 
 pub const PROTOCOL_VERSION: i32 = 1;
@@ -85,6 +87,12 @@ pub struct ContactRequest {
     pub nickname: String,
     pub info:     String,
     pub avatar:   Option<Vec<u8>>,
+}
+
+pub struct FileRequest {
+    pub guid: i64,
+    pub name: String,
+    pub hash: String,
 }
 
 // ── Low-level I/O helpers ─────────────────────────────────────────────────────
@@ -541,6 +549,35 @@ pub fn encode_contact_response(accepted: bool) -> Result<Vec<u8>, MimirError> {
     let mut buf = Vec::with_capacity(16 + 1);
     buf.extend_from_slice(&build_header(MSG_TYPE_CONTACT_RESPONSE, 1));
     buf.push(if accepted { 1 } else { 0 });
+    Ok(buf)
+}
+
+// ── File request / response ──────────────────────────────────────────────────
+
+/// Read a FILE_REQUEST payload (header consumed).
+/// Wire: [guid(8)][name_len(4)][name][hash_len(4)][hash]
+pub async fn read_file_request(conn: &AsyncConn) -> Result<FileRequest, MimirError> {
+    let guid = read_i64(conn).await?;
+    let name_bytes = read_blob_i32(conn).await?;
+    let name = String::from_utf8(name_bytes)
+        .map_err(|e| MimirError::Protocol(e.to_string()))?;
+    let hash_bytes = read_blob_i32(conn).await?;
+    let hash = String::from_utf8(hash_bytes)
+        .map_err(|e| MimirError::Protocol(e.to_string()))?;
+    Ok(FileRequest { guid, name, hash })
+}
+
+pub fn encode_file_request(req: &FileRequest) -> Result<Vec<u8>, MimirError> {
+    let name = req.name.as_bytes();
+    let hash = req.hash.as_bytes();
+    let payload_len = 8 + 4 + name.len() + 4 + hash.len();
+    let mut buf = Vec::with_capacity(16 + payload_len);
+    buf.extend_from_slice(&build_header(MSG_TYPE_FILE_REQUEST, payload_len as i64));
+    buf.extend_from_slice(&req.guid.to_be_bytes());
+    buf.extend_from_slice(&(name.len() as i32).to_be_bytes());
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(&(hash.len() as i32).to_be_bytes());
+    buf.extend_from_slice(hash);
     Ok(buf)
 }
 

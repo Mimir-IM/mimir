@@ -149,14 +149,14 @@ impl Resolver {
                     return keys;
                 }
                 Ok(_) => {
-                    log::debug!(
+                    tracing::debug!(
                         "resolver: tracker {} returned 0 peers for {}",
                         hex::encode(&tracker.pubkey[..4]),
                         hex::encode(&permanent_pubkey[..4])
                     );
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "resolver: tracker {} failed: {e}",
                         hex::encode(&tracker.pubkey[..4])
                     );
@@ -180,7 +180,7 @@ impl Resolver {
         let our_addr = self.our_addr;
         let sig = sign(&self.signing_key, &our_addr);
         let public_key  = self.signing_key.verifying_key().to_bytes();
-        log::info!("Announcing addr {} from {}", hex::encode(&our_addr[..8]), hex::encode(&public_key));
+        tracing::info!("Announcing addr {} from {}", hex::encode(&our_addr[..8]), hex::encode(&public_key));
 
         // Build announce frame:
         // [VERSION:1][nonce:4][CMD_ANNOUNCE:1]
@@ -202,19 +202,19 @@ impl Resolver {
             let _ = self.node.recv_datagram_with_timeout(tracker.port, 1).await;
 
             if let Err(e) = self.node.send_datagram(&tracker.pubkey, tracker.port, &frame).await {
-                log::warn!("resolver: announce send to {} failed: {e}", hex::encode(&tracker.pubkey[..4]));
+                tracing::warn!("resolver: announce send to {} failed: {e}", hex::encode(&tracker.pubkey[..4]));
                 continue;
             }
             // Best-effort read of TTL response (not required for correctness).
             match self.recv_matching(&tracker.pubkey, &nonce, CMD_ANNOUNCE, tracker.port).await {
                 Ok(payload) if payload.len() >= 8 => {
                     let ttl = i64::from_be_bytes(payload[..8].try_into().unwrap());
-                    log::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
+                    tracing::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
                     return Ok(ttl);
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    log::debug!("resolver: no announce ack from {}: {e}", hex::encode(&tracker.pubkey[..4]));
+                    tracing::debug!("resolver: no announce ack from {}: {e}", hex::encode(&tracker.pubkey[..4]));
                 }
             }
         }
@@ -245,7 +245,7 @@ impl Resolver {
 
         let payload = self.recv_matching(&tracker.pubkey, &nonce, CMD_GET_ADDRS, tracker.port).await?;
         let rtt_ms = t0.elapsed().as_millis() as u64;
-        log::debug!("resolver: tracker {} RTT = {rtt_ms}ms", hex::encode(&tracker.pubkey[..4]));
+        tracing::debug!("resolver: tracker {} RTT = {rtt_ms}ms", hex::encode(&tracker.pubkey[..4]));
 
         parse_get_addrs_response(&payload, permanent_pubkey)
     }
@@ -258,7 +258,7 @@ impl Resolver {
                 .recv_datagram_with_timeout(port, RECV_TIMEOUT_MS)
                 .await
                 .map_err(|e| {
-                    log::warn!(
+                    tracing::warn!(
                         "resolver: recv_matching timed out waiting for cmd=0x{:02x} from {}",
                         cmd, hex::encode(&expected_sender[..4])
                     );
@@ -266,22 +266,22 @@ impl Resolver {
                 })?;
 
             if sender.len() != 32 || sender.as_slice() != expected_sender.as_slice() {
-                log::debug!(
+                tracing::debug!(
                     "resolver: recv_matching: datagram from unexpected sender {}, discarding",
                     hex::encode(&sender[..sender.len().min(4)])
                 );
                 continue;
             }
             if data.len() < 5 {
-                log::debug!("resolver: recv_matching: datagram too short ({} bytes)", data.len());
+                tracing::debug!("resolver: recv_matching: datagram too short ({} bytes)", data.len());
                 continue;
             }
             if data[0..4] != *nonce {
-                log::debug!("resolver: recv_matching: nonce mismatch, discarding stale datagram");
+                tracing::debug!("resolver: recv_matching: nonce mismatch, discarding stale datagram");
                 continue;
             }
             if data[4] != cmd {
-                log::debug!("resolver: recv_matching: cmd mismatch (got 0x{:02x}, want 0x{:02x})", data[4], cmd);
+                tracing::debug!("resolver: recv_matching: cmd mismatch (got 0x{:02x}, want 0x{:02x})", data[4], cmd);
                 continue;
             }
             return Ok(data[5..].to_vec());
@@ -329,7 +329,7 @@ fn parse_get_addrs_response(payload: &[u8], permanent_pubkey: &[u8; 32]) -> Resu
 
         // Verify: sign(permanent_sk, eph_key) must match.
         if verify(permanent_pubkey, &eph_key, sig).is_err() {
-            log::warn!("resolver: bad signature for peer eph={}", hex::encode(&eph_key[..4]));
+            tracing::warn!("resolver: bad signature for peer eph={}", hex::encode(&eph_key[..4]));
             continue;
         }
 

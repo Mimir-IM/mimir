@@ -7,6 +7,7 @@ pub mod resolver;
 pub mod ygg_selector;
 
 use std::collections::HashMap;
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +24,36 @@ use data_stream::data_recv_task;
 use protocol::{read_exact, STREAM_ROLE_CONTROL, STREAM_ROLE_DATA};
 use resolver::Resolver;
 use ygg_selector::{YggSelector, run_selector};
+
+// ── Tracing initialisation ───────────────────────────────────────────────────
+
+fn init_tracing() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::EnvFilter;
+
+        let env_filter = EnvFilter::new(
+            "ironwood=info,yggdrasil=info,ygg_stream=info,debug"
+        );
+
+        #[cfg(target_os = "android")]
+        {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_android::layer("Mimir").unwrap())
+                .init();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer())
+                .init();
+        }
+    });
+}
 
 // ── Peers map type alias ──────────────────────────────────────────────────────
 
@@ -117,6 +148,9 @@ struct PeerState {
     /// Maps permanent peer key → control-stream write channel.
     /// Shared with data_recv_task so it can ACK large files over the control stream.
     ctrl_write_txs: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Maps file name → declared size for pending file requests.
+    /// Shared with data_recv_task to reject oversized responses.
+    pending_file_sizes: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl PeerState {
@@ -131,6 +165,7 @@ impl PeerState {
             peer_port: self.peer_port,
             eph_to_perm: Arc::clone(&self.eph_to_perm),
             ctrl_write_txs: Arc::clone(&self.ctrl_write_txs),
+            pending_file_sizes: Arc::clone(&self.pending_file_sizes),
         })
     }
 
@@ -203,20 +238,7 @@ impl PeerNode {
         event_listener: Box<dyn PeerEventListener>,
         info_provider: Box<dyn InfoProvider>
     ) -> Result<Self, MimirError> {
-        #[cfg(target_os = "android")]
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Debug)
-                .with_tag("Mimir")
-                .with_filter(
-                    android_logger::FilterBuilder::new()
-                        .filter_module("ironwood", log::LevelFilter::Info)
-                        .filter_module("yggdrasil", log::LevelFilter::Info)
-                        .filter_module("ygg_stream", log::LevelFilter::Info)
-                        .filter(None, log::LevelFilter::Debug)
-                        .build(),
-                ),
-        );
+        init_tracing();
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -291,6 +313,7 @@ impl PeerNode {
             resolver,
             eph_to_perm,
             ctrl_write_txs,
+            pending_file_sizes: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Spawn the inbound-accept loop.
@@ -313,7 +336,7 @@ impl PeerNode {
                                         let role = match read_exact(&conn, 1).await {
                                             Ok(b) => b[0],
                                             Err(e) => {
-                                                log::warn!("Accept: failed to read role byte: {}", e);
+                                                tracing::warn!("Accept: failed to read role byte: {}", e);
                                                 return;
                                             }
                                         };
@@ -329,7 +352,7 @@ impl PeerNode {
                                                 let peer_eph: [u8; 32] = match conn.public_key().try_into() {
                                                     Ok(k) => k,
                                                     Err(_) => {
-                                                        log::warn!("Accept data: unexpected eph key length");
+                                                        tracing::warn!("Accept data: unexpected eph key length");
                                                         return;
                                                     }
                                                 };
@@ -341,22 +364,23 @@ impl PeerNode {
                                                     Some(pk) => {
                                                         let cb = Arc::clone(&s.event_cb);
                                                         let txs = Arc::clone(&s.ctrl_write_txs);
-                                                        tokio::spawn(data_recv_task(conn, pk, cb, txs));
+                                                        let pfs = Arc::clone(&s.pending_file_sizes);
+                                                        tokio::spawn(data_recv_task(conn, pk, cb, txs, pfs));
                                                     }
                                                     None => {
-                                                        log::warn!("Accept data: unknown eph key {}, dropping",
+                                                        tracing::warn!("Accept data: unknown eph key {}, dropping",
                                                                    hex::encode(peer_eph));
                                                     }
                                                 }
                                             }
                                             other => {
-                                                log::warn!("Accept: unknown stream role {:#04x}, dropping", other);
+                                                tracing::warn!("Accept: unknown stream role {:#04x}, dropping", other);
                                             }
                                         }
                                     });
                                 }
                                 Err(e) => {
-                                    log::error!("Accept error: {}", e);
+                                    tracing::error!("Accept error: {}", e);
                                     break;
                                 }
                             }
@@ -551,7 +575,7 @@ impl PeerNode {
                         return; // connected successfully
                     }
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "connect_to_peer {}: eph {} failed: {}",
                             hex::encode(&key[..4]),
                             hex::encode(&eph_key[..4]),
@@ -560,7 +584,7 @@ impl PeerNode {
                     }
                 }
             }
-            log::error!("connect_to_peer {}: all addresses exhausted", hex::encode(&key[..4]));
+            tracing::error!("connect_to_peer {}: all addresses exhausted", hex::encode(&key[..4]));
         });
         Ok(())
     }
@@ -575,6 +599,21 @@ impl PeerNode {
     pub fn send_contact_response(&self, pubkey: Vec<u8>, accepted: bool) -> Result<(), MimirError> {
         let key = vec_to_key(&pubkey)?;
         self.state.send_cmd(&key, OutgoingCmd::ContactResponse { accepted })
+    }
+
+    /// Request a file from a connected peer.
+    ///
+    /// `name` is the random filename from the message metadata.
+    /// `hash` is the SHA-256 hex hash for verification.
+    /// The peer will stream the file back as a MSG_TYPE_FILE_RESPONSE
+    /// delivered through `on_message_received`.
+    pub fn request_file(&self, pubkey: Vec<u8>, guid: i64, name: String, hash: String, size: i64) -> Result<(), MimirError> {
+        let key = vec_to_key(&pubkey)?;
+        // Store the declared size so data_recv_task can reject oversized responses.
+        if let Ok(mut map) = self.state.pending_file_sizes.lock() {
+            map.insert(name.clone(), size);
+        }
+        self.state.send_cmd(&key, OutgoingCmd::FileRequest { guid, name, hash, size })
     }
 
     /// Close the connection to `pubkey` (if any).

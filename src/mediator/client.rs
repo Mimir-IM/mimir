@@ -480,7 +480,7 @@ impl MediatorClient {
             let resp = match read_response(&self.conn, &self.last_activity_ms).await {
                 Ok(r)  => r,
                 Err(e) => {
-                    log::error!("mediator reader error: {e}");
+                    tracing::error!("mediator reader error: {e}");
                     // Use swap to ensure only one of reader/ping fires on_disconnected.
                     if !self.disconnected.swap(true, Ordering::SeqCst) {
                         listener.on_disconnected(self.mediator_pubkey.to_vec());
@@ -505,7 +505,7 @@ impl MediatorClient {
                         self.handle_member_info_update(resp.payload, listener);
                     }
                     other => {
-                        log::warn!("mediator: unknown push cmd=0x{other:04x}");
+                        tracing::warn!("mediator: unknown push cmd=0x{other:04x}");
                     }
                 }
                 continue;
@@ -516,7 +516,7 @@ impl MediatorClient {
             if let Some(tx) = map.remove(&resp.req_id) {
                 let _ = tx.send(resp);
             } else {
-                log::warn!(
+                tracing::warn!(
                     "mediator: unmatched response req_id={} status={}",
                     resp.req_id, resp.status
                 );
@@ -527,7 +527,7 @@ impl MediatorClient {
     fn handle_push_message(&self, payload: Vec<u8>, listener: &dyn MediatorEventListener) {
         let tlvs = match parse_tlvs(&payload) {
             Ok(t)  => t,
-            Err(e) => { log::error!("push_message parse error: {e}"); return; }
+            Err(e) => { tracing::error!("push_message parse error: {e}"); return; }
         };
         let chat_id    = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
         let message_id = tlvs.get_i64(TAG_MESSAGE_ID).unwrap_or(0);
@@ -557,7 +557,7 @@ impl MediatorClient {
     fn handle_push_invite(&self, payload: Vec<u8>, listener: &dyn MediatorEventListener) {
         let tlvs = match parse_tlvs(&payload) {
             Ok(t)  => t,
-            Err(e) => { log::error!("push_invite parse error: {e}"); return; }
+            Err(e) => { tracing::error!("push_invite parse error: {e}"); return; }
         };
         let invite_id  = tlvs.get_i64(TAG_INVITE_ID).unwrap_or(0);
         let chat_id    = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
@@ -579,7 +579,7 @@ impl MediatorClient {
     async fn handle_member_info_request(&self,payload:  Vec<u8>, listener: &dyn MediatorEventListener) {
         let tlvs = match parse_tlvs(&payload) {
             Ok(t)  => t,
-            Err(e) => { log::error!("member_info_request parse error: {e}"); return; }
+            Err(e) => { tracing::error!("member_info_request parse error: {e}"); return; }
         };
         let chat_id     = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
         let last_update = tlvs.opt_i64(TAG_LAST_UPDATE).unwrap_or(0);
@@ -593,7 +593,7 @@ impl MediatorClient {
                     &info_clone.encrypted_blob,
                     info_clone.timestamp,
                 ).await {
-                    log::error!("update_member_info after request failed: {e}");
+                    tracing::error!("update_member_info after request failed: {e}");
                 }
             });
         }
@@ -602,7 +602,7 @@ impl MediatorClient {
     fn handle_member_info_update(&self, payload: Vec<u8>, listener: &dyn MediatorEventListener) {
         let tlvs = match parse_tlvs(&payload) {
             Ok(t)  => t,
-            Err(e) => { log::error!("member_info_update parse error: {e}"); return; }
+            Err(e) => { tracing::error!("member_info_update parse error: {e}"); return; }
         };
         let chat_id       = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
         let member_pubkey = tlvs.opt_bytes(TAG_USER_PUBKEY).unwrap_or_default();
@@ -624,7 +624,7 @@ impl MediatorClient {
             );
             if elapsed >= PING_INTERVAL.as_millis() as u64 {
                 if let Err(e) = self.request(CMD_PING, &[]).await {
-                    log::error!("mediator ping failed: {e}");
+                    tracing::error!("mediator ping failed: {e}");
                     // Zombie connection detected — notify and stop everything.
                     if !self.disconnected.swap(true, Ordering::SeqCst) {
                         listener.on_disconnected(self.mediator_pubkey.to_vec());

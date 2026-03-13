@@ -136,8 +136,10 @@ callback interface PeerEventListener {
     /// A text/file message arrived from `pubkey`.
     ///
     /// For text (msg_type == 0 or 2): `data` is the message content.
-    /// For image/file (msg_type == 1 or 3): `data` is the raw wire payload —
-    /// [metaJsonSize(4 BE)][metaJson][fileBytes] — exactly as received.
+    /// For image/file (msg_type == 1 or 3): `data` is the JSON metadata only
+    /// (no file bytes).  Use `request_file` to download the actual file.
+    /// For file response (msg_type == 4001): `data` is the wire payload —
+    /// [metaJsonSize(4 BE)][metaJson][fileBytes] — save the file to disk.
     void on_message_received(
         bytes  pubkey,
         i64    guid,
@@ -318,8 +320,8 @@ interface PeerNode {
     /// or an inbound connection triggered on_peer_connected).
     ///
     /// For text (msg_type 0 or 2): pass message content as `data`.
-    /// For image/file (msg_type 1 or 3): pass the already-assembled wire
-    /// payload [metaJsonSize(4 BE)][metaJson][fileBytes] as `data`.
+    /// For image/file (msg_type 1 or 3): pass only the JSON metadata as `data`.
+    /// The recipient uses `request_file` to download the actual file separately.
     [Throws=MimirError]
     void send_message(
         bytes  pubkey,
@@ -344,6 +346,15 @@ interface PeerNode {
     /// Send a contact response (accept/reject) to `pubkey`.
     [Throws=MimirError]
     void send_contact_response(bytes pubkey, boolean accepted);
+
+    /// Request a file from a connected peer.
+    ///
+    /// `name` is the random filename from the message metadata.
+    /// `hash` is the SHA-256 hex hash for verification.
+    /// The peer will stream the file back as a FILE_RESPONSE delivered
+    /// through `on_message_received` with msg_type = 4001.
+    [Throws=MimirError]
+    void request_file(bytes pubkey, i64 guid, string name, string hash, i64 size);
 
     /// Close the connection to `pubkey` (if any).
     void disconnect_peer(bytes pubkey);

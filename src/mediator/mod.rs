@@ -64,7 +64,7 @@ impl MediatorNode {
         let mgr = Arc::clone(&self.manager);
         self.rt.spawn(async move {
             if let Err(e) = mgr.get_or_create(&key).await {
-                log::error!("connect_to_mediator {}: {e}", hex::encode(key));
+                tracing::error!("connect_to_mediator {}: {e}", hex::encode(key));
             }
         });
         Ok(())

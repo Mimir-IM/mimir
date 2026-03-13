@@ -64,6 +64,7 @@ pub enum OutgoingCmd {
     CallPacket(Vec<u8>),
     ContactRequest { message: String },
     ContactResponse { accepted: bool },
+    FileRequest { guid: i64, name: String, hash: String, size: i64 },
     Disconnect,
     /// Sent by register_peer when a newer connection replaces this one.
     /// Causes the loop to exit cleanly WITHOUT firing the HANGUP callback,
@@ -89,6 +90,10 @@ pub struct ConnContext {
     /// Allows data_recv_task to send MSG_TYPE_OK acknowledgements back over
     /// the control stream after a large file is fully received.
     pub ctrl_write_txs: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Maps file name → declared size (bytes) for pending file requests.
+    /// Populated by `request_file`, checked by `data_recv_task` to reject
+    /// responses whose actual size exceeds the declared size.
+    pub pending_file_sizes: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 // ── Entry points ──────────────────────────────────────────────────────────────
@@ -108,7 +113,7 @@ pub async fn run_inbound(conn: Arc<AsyncConn>, ctx: Arc<ConnContext>) -> Option<
             let peer_eph: [u8; 32] = match conn.public_key().try_into() {
                 Ok(k) => k,
                 Err(_) => {
-                    log::warn!("Inbound: unexpected eph key length");
+                    tracing::warn!("Inbound: unexpected eph key length");
                     return None;
                 }
             };
@@ -122,7 +127,7 @@ pub async fn run_inbound(conn: Arc<AsyncConn>, ctx: Arc<ConnContext>) -> Option<
             let send_data_conn = match ctx.node.connect(&peer_eph, ctx.peer_port).await {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
-                    log::warn!("Inbound: failed to open data stream to {}: {}",
+                    tracing::warn!("Inbound: failed to open data stream to {}: {}",
                                hex::encode(peer_key), e);
                     ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
                     return None;
@@ -130,7 +135,7 @@ pub async fn run_inbound(conn: Arc<AsyncConn>, ctx: Arc<ConnContext>) -> Option<
             };
             // Mark this stream as a data stream.
             if send_data_conn.write(&[STREAM_ROLE_DATA]).await.is_err() {
-                log::warn!("Inbound: failed to write data stream role byte");
+                tracing::warn!("Inbound: failed to write data stream role byte");
                 ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
                 return None;
             }
@@ -145,11 +150,11 @@ pub async fn run_inbound(conn: Arc<AsyncConn>, ctx: Arc<ConnContext>) -> Option<
             Some((peer_key, tx))
         }
         Ok(Err(e)) => {
-            log::warn!("Inbound auth failed: {}", e);
+            tracing::warn!("Inbound auth failed: {}", e);
             None
         }
         Err(_) => {
-            log::warn!("Inbound auth timed out");
+            tracing::warn!("Inbound auth timed out");
             None
         }
     }
@@ -161,7 +166,7 @@ pub async fn run_outbound(conn: Arc<AsyncConn>, peer_key: [u8; 32], ctx: Arc<Con
     // Write the control-stream role byte before the auth handshake.
     // The inbound accept loop reads this first to distinguish control from data streams.
     if conn.write(&[STREAM_ROLE_CONTROL]).await.is_err() {
-        log::warn!("Outbound: failed to write control role byte");
+        tracing::warn!("Outbound: failed to write control role byte");
         return None;
     }
 
@@ -177,7 +182,7 @@ pub async fn run_outbound(conn: Arc<AsyncConn>, peer_key: [u8; 32], ctx: Arc<Con
             let peer_eph: [u8; 32] = match conn.public_key().try_into() {
                 Ok(k) => k,
                 Err(_) => {
-                    log::warn!("Outbound: unexpected eph key length");
+                    tracing::warn!("Outbound: unexpected eph key length");
                     return None;
                 }
             };
@@ -190,14 +195,14 @@ pub async fn run_outbound(conn: Arc<AsyncConn>, peer_key: [u8; 32], ctx: Arc<Con
             let send_data_conn = match ctx.node.connect(&peer_eph, ctx.peer_port).await {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
-                    log::warn!("Outbound: failed to open data stream to {}: {}",
+                    tracing::warn!("Outbound: failed to open data stream to {}: {}",
                                hex::encode(peer_key), e);
                     ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
                     return None;
                 }
             };
             if send_data_conn.write(&[STREAM_ROLE_DATA]).await.is_err() {
-                log::warn!("Outbound: failed to write data stream role byte");
+                tracing::warn!("Outbound: failed to write data stream role byte");
                 ctx.eph_to_perm.lock().unwrap().remove(&peer_eph);
                 return None;
             }
@@ -210,11 +215,11 @@ pub async fn run_outbound(conn: Arc<AsyncConn>, peer_key: [u8; 32], ctx: Arc<Con
             Some(tx)
         }
         Ok(Err(e)) => {
-            log::warn!("Outbound auth to {} failed: {}", hex::encode(peer_key), e);
+            tracing::warn!("Outbound auth to {} failed: {}", hex::encode(peer_key), e);
             None
         }
         Err(_) => {
-            log::warn!("Outbound auth to {} timed out", hex::encode(peer_key));
+            tracing::warn!("Outbound auth to {} timed out", hex::encode(peer_key));
             None
         }
     }
@@ -408,13 +413,13 @@ async fn message_loop(
         // Check timeouts before blocking
         let now = Instant::now();
         if now.duration_since(last_act) >= idle_timeout {
-            log::info!("Peer {} idle timeout", &address);
+            tracing::info!("Peer {} idle timeout", &address);
             dead_peer = true;
             break 'main;
         }
         if let Some(sent) = last_ping_sent {
             if sent > last_pong && now.duration_since(sent) >= PING_TIMEOUT {
-                log::warn!("Peer {} pong timeout", &address);
+                tracing::warn!("Peer {} pong timeout", &address);
                 dead_peer = true;
                 break 'main;
             }
@@ -436,9 +441,9 @@ async fn message_loop(
                             last_activity = Instant::now();
                         }
                         if let Err(e) = handle_incoming(
-                            f, &peer_key, &ctx, &write_tx, &mut call_status, &mut last_pong, &mut peer_flags,
+                            f, &peer_key, &ctx, &write_tx, &data_write_tx, &mut call_status, &mut last_pong, &mut peer_flags,
                         ).await {
-                            log::error!("Error handling frame from {}: {}", &address, e);
+                            tracing::error!("Error handling frame from {}: {}", &address, e);
                             break 'main;
                         }
                     }
@@ -465,7 +470,7 @@ async fn message_loop(
                             c, &write_tx, &data_write_tx, &mut call_status,
                             &ctx, &peer_key, &mut last_pong,
                         ).await {
-                            log::error!("Error sending to {}: {}", &address, e);
+                            tracing::error!("Error sending to {}: {}", &address, e);
                             break 'main;
                         }
                     }
@@ -508,6 +513,7 @@ async fn handle_incoming(
     peer_key: &[u8; 32],
     ctx: &ConnContext,
     write_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    data_write_tx: &mpsc::UnboundedSender<(i64, Vec<u8>)>,
     call_status: &mut CallStatus,
     last_pong: &mut Instant,
     peer_flags: &mut i32,
@@ -524,7 +530,7 @@ async fn handle_incoming(
 
         IncomingFrame::Message(msg) => {
             if *peer_flags <= 0 {
-                log::debug!("Dropping message from non-contact {}", hex::encode(peer_key));
+                tracing::debug!("Dropping message from non-contact {}", hex::encode(peer_key));
                 return Ok(());
             }
             // Acknowledge receipt.
@@ -551,7 +557,7 @@ async fn handle_incoming(
 
         IncomingFrame::InfoRequest(since) => {
             if *peer_flags <= 0 {
-                log::debug!("Ignoring info request from non-contact {}", hex::encode(peer_key));
+                tracing::debug!("Ignoring info request from non-contact {}", hex::encode(peer_key));
                 return Ok(());
             }
             let info = ctx.info_cb.get_my_info(since);
@@ -570,7 +576,7 @@ async fn handle_incoming(
 
         IncomingFrame::InfoResponse(r) => {
             if *peer_flags <= 0 {
-                log::debug!("Ignoring info response from non-contact {}", hex::encode(peer_key));
+                tracing::debug!("Ignoring info response from non-contact {}", hex::encode(peer_key));
                 return Ok(());
             }
             ctx.info_cb.update_contact_info(peer_key.to_vec(), ContactInfo {
@@ -599,9 +605,25 @@ async fn handle_incoming(
             *peer_flags = ctx.info_cb.get_peer_flags(peer_key.to_vec());
         }
 
+        IncomingFrame::FileRequest(req) => {
+            if *peer_flags <= 0 {
+                tracing::debug!("Ignoring file request from non-contact {}", hex::encode(peer_key));
+                return Ok(());
+            }
+            // Serve the requested file asynchronously to avoid blocking the message loop.
+            let files_dir = ctx.info_cb.get_files_dir();
+            let write_tx = write_tx.clone();
+            let data_write_tx = data_write_tx.clone();
+            let peer_key_copy = *peer_key;
+            let event_cb = Arc::clone(&ctx.event_cb);
+            tokio::spawn(async move {
+                serve_file_request(files_dir, req.guid, req.name, req.hash, write_tx, data_write_tx, peer_key_copy, event_cb).await;
+            });
+        }
+
         IncomingFrame::CallOffer(_offer) => {
             if *peer_flags <= 0 {
-                log::debug!("Dropping call offer from non-contact {}", hex::encode(peer_key));
+                tracing::debug!("Dropping call offer from non-contact {}", hex::encode(peer_key));
                 return Ok(());
             }
             if matches!(*call_status, CallStatus::Idle) {
@@ -633,7 +655,7 @@ async fn handle_incoming(
         }
 
         IncomingFrame::Unknown(msg_type, size) => {
-            log::debug!("Unknown message type {} ({} bytes) from {}", msg_type, size, hex::encode(peer_key));
+            tracing::debug!("Unknown message type {} ({} bytes) from {}", msg_type, size, hex::encode(peer_key));
         }
     }
     Ok(())
@@ -683,6 +705,13 @@ async fn handle_outgoing(
 
         OutgoingCmd::ContactResponse { accepted } => {
             let bytes = encode_contact_response(accepted)?;
+            write_tx.send(bytes)
+                .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
+        }
+
+        OutgoingCmd::FileRequest { guid, name, hash, size: _ } => {
+            let req = super::protocol::FileRequest { guid, name, hash };
+            let bytes = encode_file_request(&req)?;
             write_tx.send(bytes)
                 .map_err(|_| MimirError::Io("write channel closed".to_string()))?;
         }
@@ -760,6 +789,7 @@ pub enum IncomingFrame {
     CallPacket(Vec<u8>),
     ContactRequest(super::protocol::ContactRequest),
     ContactResponse(bool),
+    FileRequest(super::protocol::FileRequest),
     Ok(i64),
     Unknown(i32, i64),
 }
@@ -775,7 +805,7 @@ async fn reader_task(
         let frame = match read_one_frame(&conn).await {
             Ok(f) => f,
             Err(e) => {
-                log::info!("Reader task: connection closed ({})", e);
+                tracing::info!("Reader task: connection closed ({})", e);
                 break;
             }
         };
@@ -829,6 +859,11 @@ async fn read_one_frame(conn: &AsyncConn) -> Result<IncomingFrame, MimirError> {
             IncomingFrame::ContactRequest(req)
         }
 
+        MSG_TYPE_FILE_REQUEST => {
+            let req = read_file_request(conn).await?;
+            IncomingFrame::FileRequest(req)
+        }
+
         MSG_TYPE_CONTACT_RESPONSE => {
             let accepted = read_contact_response(conn).await?;
             IncomingFrame::ContactResponse(accepted)
@@ -858,7 +893,7 @@ async fn read_one_frame(conn: &AsyncConn) -> Result<IncomingFrame, MimirError> {
 async fn writer_task(conn: Arc<AsyncConn>, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(bytes) = rx.recv().await {
         if let Err(e) = conn.write(&bytes).await {
-            log::info!("Writer task: write failed ({})", e);
+            tracing::info!("Writer task: write failed ({})", e);
             break;
         }
     }
@@ -990,6 +1025,91 @@ fn encode_call_packet(data: &[u8]) -> Result<Vec<u8>, MimirError> {
     buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
     buf.extend_from_slice(data);
     Ok(buf)
+}
+
+// ── File serving ──────────────────────────────────────────────────────────────
+
+/// Reads a file from disk, verifies its hash, and sends it back as a
+/// MSG_TYPE_FILE_RESPONSE to the requesting peer.  Runs in a spawned task
+/// so the message loop is never blocked by file I/O.
+async fn serve_file_request(
+    files_dir: String,
+    guid: i64,
+    name: String,
+    hash: String,
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    data_write_tx: mpsc::UnboundedSender<(i64, Vec<u8>)>,
+    peer_key: [u8; 32],
+    _event_cb: Arc<dyn PeerEventListener>,
+) {
+    let path = std::path::PathBuf::from(&files_dir).join(&name);
+    let path2 = path.clone();
+
+    // Read the file on a blocking thread to avoid stalling the Tokio runtime.
+    let file_bytes = match tokio::task::spawn_blocking(move || std::fs::read(&path2)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            tracing::warn!("File request for {}: read error ({})", name, e);
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("File request for {}: spawn_blocking failed ({})", name, e);
+            return;
+        }
+    };
+
+    // Verify SHA-256 hash.
+    use sha2::{Sha256, Digest};
+    let computed_hash = hex::encode(Sha256::digest(&file_bytes));
+    if computed_hash != hash {
+        tracing::warn!("File request hash mismatch for {}: expected {}, got {}", name, hash, &computed_hash[..16]);
+        return;
+    }
+
+    // Build response payload: [metaJsonSize:4 BE][metaJson][fileBytes]
+    let meta_json = serde_json::json!({
+        "name": name,
+        "hash": hash,
+        "size": file_bytes.len(),
+    });
+    let meta_bytes = meta_json.to_string().into_bytes();
+    let meta_size = meta_bytes.len();
+    let mut payload = Vec::with_capacity(4 + meta_size + file_bytes.len());
+    payload.extend_from_slice(&(meta_size as i32).to_be_bytes());
+    payload.extend_from_slice(&meta_bytes);
+    payload.extend_from_slice(&file_bytes);
+
+    // Use the original message guid so both sides can correlate progress.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    if payload.len() > FILE_STREAM_THRESHOLD {
+        let frame = encode_data_frame(guid, 0, now, 0, MSG_TYPE_FILE_RESPONSE, &payload);
+        if let Err(e) = data_write_tx.send((guid, frame)) {
+            tracing::warn!("File response send failed (data stream): {}", e);
+        }
+    } else {
+        let msg = P2pMessage {
+            guid,
+            reply_to: 0,
+            send_time: now,
+            edit_time: 0,
+            msg_type: MSG_TYPE_FILE_RESPONSE,
+            data: payload,
+        };
+        match encode_message(&msg) {
+            Ok(bytes) => {
+                if let Err(e) = write_tx.send(bytes) {
+                    tracing::warn!("File response send failed (control): {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("File response encode failed: {}", e),
+        }
+    }
+
+    tracing::info!("Served file {} ({} bytes) to {}", name, file_bytes.len(), hex::encode(&peer_key[..4]));
 }
 
 // ── Misc helpers ──────────────────────────────────────────────────────────────

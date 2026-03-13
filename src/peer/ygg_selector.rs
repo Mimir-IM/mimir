@@ -209,13 +209,13 @@ pub(super) async fn run_selector(selector: Arc<YggSelector>, node:     Arc<Async
                 .map(|r| r.uri.clone());
             match new_peer {
                 Some(uri) => {
-                    log::info!("[ygg_selector] peer list changed, switching to {:?}", uri);
+                    tracing::info!("[ygg_selector] peer list changed, switching to {:?}", uri);
                     let _ = node.add_peer(&uri).await;
                     *selector.active_uri.lock().unwrap() = Some(uri);
                 }
                 None => {
                     *selector.active_uri.lock().unwrap() = None;
-                    log::warn!("[ygg_selector] peer list is now empty");
+                    tracing::warn!("[ygg_selector] peer list is now empty");
                 }
             }
             selector.publish_info();
@@ -271,20 +271,20 @@ pub(super) async fn run_selector(selector: Arc<YggSelector>, node:     Arc<Async
         // ── Genuine peer failure — switch to the next-best ───────────────────
         let prev = selector.active_uri.lock().unwrap().clone();
         if let Some(ref uri) = prev {
-            log::warn!("[ygg_selector] peer {:?} failed, switching", uri);
+            tracing::warn!("[ygg_selector] peer {:?} failed, switching", uri);
             selector.record_failure(uri);
             let _ = node.remove_peer(uri).await;
         }
 
         match selector.pick_best() {
             Some(best) => {
-                log::info!("[ygg_selector] connecting to {:?}", best);
+                tracing::info!("[ygg_selector] connecting to {:?}", best);
                 let _ = node.add_peer(&best).await;
                 *selector.active_uri.lock().unwrap() = Some(best);
             }
             None => {
                 *selector.active_uri.lock().unwrap() = None;
-                log::warn!("[ygg_selector] no peers configured");
+                tracing::warn!("[ygg_selector] no peers configured");
             }
         }
         selector.publish_info();

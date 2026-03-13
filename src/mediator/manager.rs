@@ -111,7 +111,7 @@ impl MediatorManager {
 
         match client.get_user_chats().await {
             Ok(server_chats) => chat_ids.extend(server_chats),
-            Err(e) => log::warn!("mediator {}: get_user_chats failed: {e}", &hex[..8]),
+            Err(e) => tracing::warn!("mediator {}: get_user_chats failed: {e}", &hex[..8]),
         }
 
         // Insert atomically while checking that the connection hasn't already died.
@@ -141,7 +141,7 @@ impl MediatorManager {
         // Firing it again here would cause double syncMissedMessages runs.
         for chat_id in chat_ids {
             if let Err(e) = client.subscribe(chat_id).await {
-                log::warn!("mediator {}: auto-subscribe chat {chat_id} failed: {e}", &hex[..8]);
+                tracing::warn!("mediator {}: auto-subscribe chat {chat_id} failed: {e}", &hex[..8]);
             }
         }
 
@@ -191,13 +191,13 @@ impl MediatorManager {
         };
 
         if attempt > MAX_ATTEMPTS {
-            log::warn!("mediator {}: max reconnection attempts reached", &hex[..8]);
+            tracing::warn!("mediator {}: max reconnection attempts reached", &hex[..8]);
             return;
         }
 
         let exponent = (attempt - 1).min(30) as u32;
         let delay = BASE_DELAY.saturating_mul(1u32 << exponent).min(MAX_DELAY);
-        log::info!("mediator {}: reconnecting in {delay:?} (attempt {attempt})", &hex[..8]);
+        tracing::info!("mediator {}: reconnecting in {delay:?} (attempt {attempt})", &hex[..8]);
 
         let mgr = Arc::clone(self);
         let mut stop_rx = self.stop_tx.subscribe();
@@ -210,7 +210,7 @@ impl MediatorManager {
 
             // Use get_or_create so the per-key lock prevents parallel reconnects.
             if let Err(e) = mgr.get_or_create(&mediator_pubkey).await {
-                log::error!("mediator {}: reconnect failed: {e}", &hex[..8]);
+                tracing::error!("mediator {}: reconnect failed: {e}", &hex[..8]);
                 mgr.schedule_reconnect(mediator_pubkey);
             }
         });
@@ -307,10 +307,10 @@ impl MediatorEventListener for ReconnectListener {
         // If remove_client returns false, a newer live client is already in the
         // map (stale reader firing late) — do not disrupt it.
         if self.manager.remove_client(&hex) {
-            log::warn!("mediator {}: disconnected, scheduling reconnect", &hex[..8.min(hex.len())]);
+            tracing::warn!("mediator {}: disconnected, scheduling reconnect", &hex[..8.min(hex.len())]);
             self.manager.schedule_reconnect(self.pubkey);
         } else {
-            log::debug!("mediator {}: stale disconnect notification ignored", &hex[..8.min(hex.len())]);
+            tracing::debug!("mediator {}: stale disconnect notification ignored", &hex[..8.min(hex.len())]);
         }
         self.inner.on_disconnected(mediator_pubkey);
     }
