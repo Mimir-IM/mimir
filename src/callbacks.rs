@@ -41,6 +41,21 @@ pub trait PeerEventListener: Send + Sync {
     fn on_call_packet(&self, pubkey: Vec<u8>, data: Vec<u8>);
     fn on_file_receive_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_received: i64, total_bytes: i64);
     fn on_file_send_progress(&self, pubkey: Vec<u8>, guid: i64, bytes_sent: i64, total_bytes: i64);
+    /// A file has been fully received and streamed to disk.
+    /// `meta_json` is the JSON metadata from the stream header.
+    /// `file_path` is the absolute path to the temp file on disk.
+    /// The receiver should move/rename the file to its final location.
+    fn on_file_received(
+        &self,
+        pubkey: Vec<u8>,
+        guid: i64,
+        reply_to: i64,
+        send_time: i64,
+        edit_time: i64,
+        msg_type: i32,
+        meta_json: String,
+        file_path: String,
+    );
     /// A contact request arrived from a peer.
     fn on_contact_request(&self, pubkey: Vec<u8>, message: String, nickname: String, info: String, avatar: Option<Vec<u8>>);
     /// A contact response arrived (accepted or rejected).

@@ -117,6 +117,10 @@ impl PeerEventListener for EventWrapper {
         self.inner.on_file_send_progress(pubkey, guid, bytes_sent, total_bytes);
     }
 
+    fn on_file_received(&self, pubkey: Vec<u8>, guid: i64, reply_to: i64, send_time: i64, edit_time: i64, msg_type: i32, meta_json: String, file_path: String) {
+        self.inner.on_file_received(pubkey, guid, reply_to, send_time, edit_time, msg_type, meta_json, file_path);
+    }
+
     fn on_contact_request(&self, pubkey: Vec<u8>, message: String, nickname: String, info: String, avatar: Option<Vec<u8>>) {
         self.inner.on_contact_request(pubkey, message, nickname, info, avatar);
     }
@@ -363,9 +367,10 @@ impl PeerNode {
                                                 match perm_key {
                                                     Some(pk) => {
                                                         let cb = Arc::clone(&s.event_cb);
+                                                        let ic = Arc::clone(&s.info_cb);
                                                         let txs = Arc::clone(&s.ctrl_write_txs);
                                                         let pfs = Arc::clone(&s.pending_file_sizes);
-                                                        tokio::spawn(data_recv_task(conn, pk, cb, txs, pfs));
+                                                        tokio::spawn(data_recv_task(conn, pk, cb, ic, txs, pfs));
                                                     }
                                                     None => {
                                                         tracing::warn!("Accept data: unknown eph key {}, dropping",

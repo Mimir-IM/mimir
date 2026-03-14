@@ -180,7 +180,7 @@ impl Resolver {
         let our_addr = self.our_addr;
         let sig = sign(&self.signing_key, &our_addr);
         let public_key  = self.signing_key.verifying_key().to_bytes();
-        tracing::info!("Announcing addr {} from {}", hex::encode(&our_addr[..8]), hex::encode(&public_key));
+        tracing::info!("Announcing addr {} for {}", hex::encode(&our_addr), hex::encode(&public_key[..8]));
 
         // Build announce frame:
         // [VERSION:1][nonce:4][CMD_ANNOUNCE:1]

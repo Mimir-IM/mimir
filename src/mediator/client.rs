@@ -259,7 +259,10 @@ impl MediatorClient {
     /// Returns `(message_id, guid)`.
     /// `timestamp` must be milliseconds since epoch; it is converted to seconds before sending.
     pub async fn send_message(&self, chat_id: i64, guid: i64, timestamp: i64, data: &[u8]) -> Result<(i64, i64), MimirError> {
-        let mut p = Vec::new();
+        // Pre-allocate with exact capacity to avoid reallocation during growth.
+        // 3 i64 TLVs (1+1+8 = 10 each) + blob TLV header (1+5) + blob data
+        let capacity = 30 + 6 + data.len();
+        let mut p = Vec::with_capacity(capacity);
         write_tlv_i64(&mut p, TAG_CHAT_ID,      chat_id);
         write_tlv_i64(&mut p, TAG_MESSAGE_GUID,  guid);
         write_tlv_i64(&mut p, TAG_TIMESTAMP,     timestamp / 1000); // ms → seconds
@@ -525,17 +528,21 @@ impl MediatorClient {
     }
 
     fn handle_push_message(&self, payload: Vec<u8>, listener: &dyn MediatorEventListener) {
-        let tlvs = match parse_tlvs(&payload) {
+        let mut tlvs = match parse_tlvs(&payload) {
             Ok(t)  => t,
             Err(e) => { tracing::error!("push_message parse error: {e}"); return; }
         };
+        drop(payload); // Free the raw frame — fields are already in the HashMap.
         let chat_id    = tlvs.get_i64(TAG_CHAT_ID).unwrap_or(0);
         let message_id = tlvs.get_i64(TAG_MESSAGE_ID).unwrap_or(0);
         let guid       = tlvs.get_i64(TAG_MESSAGE_GUID).unwrap_or(0);
         let timestamp  = tlvs.get_i64(TAG_TIMESTAMP).unwrap_or(0)
             .saturating_mul(1000); // seconds → milliseconds
-        let author     = tlvs.opt_bytes(TAG_PUBKEY).unwrap_or_default();
-        let data       = tlvs.opt_bytes(TAG_MESSAGE_BLOB).unwrap_or_default();
+        // Use remove() instead of opt_bytes() (which clones) to avoid an extra copy
+        // of the potentially large message blob.
+        let author     = tlvs.remove(&TAG_PUBKEY).unwrap_or_default();
+        let data       = tlvs.remove(&TAG_MESSAGE_BLOB).unwrap_or_default();
+        drop(tlvs); // Free remaining small TLV entries before calling the callback.
 
         // System messages have the mediator's pubkey as author.
         if author.as_slice() == self.mediator_pubkey.as_ref() {

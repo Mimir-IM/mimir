@@ -173,6 +173,21 @@ callback interface PeerEventListener {
     /// Fired after each chunk; `bytes_sent` increases until it equals `total_bytes`.
     void on_file_send_progress(bytes pubkey, i64 guid, i64 bytes_sent, i64 total_bytes);
 
+    /// A file has been fully received and streamed to disk.
+    /// `meta_json` is the JSON metadata from the stream header.
+    /// `file_path` is the absolute path to the temp file on disk.
+    /// The receiver should move/rename the file to its final location.
+    void on_file_received(
+        bytes   pubkey,
+        i64     guid,
+        i64     reply_to,
+        i64     send_time,
+        i64     edit_time,
+        i32     msg_type,
+        string  meta_json,
+        string  file_path
+    );
+
     /// A contact (friend) request arrived from a peer.
     /// Includes the sender's profile info so it can be displayed in the UI.
     void on_contact_request(
