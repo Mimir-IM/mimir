@@ -78,6 +78,12 @@ dictionary GroupMemberInfo {
     i64     timestamp;
 };
 
+/// File metadata returned by FilesNode.file_info.
+dictionary FileInfo {
+    u64 total_size;
+    i64 message_guid;
+};
+
 /// Pre-encrypted member profile blob returned by on_member_info_request.
 /// Kotlin encrypts (nickname + info + avatar) with the chat shared key
 /// and returns the ciphertext so Rust can transmit it to the mediator.
@@ -205,6 +211,17 @@ callback interface PeerEventListener {
     /// `ok` = true if at least one tracker accepted the announce.
     /// `ttl` = TTL in seconds returned by the tracker (0 on failure).
     void on_tracker_announce(boolean ok, i32 ttl);
+};
+
+/// Receives file server upload/download events.
+/// All callbacks are invoked from Rust async tasks — must return quickly.
+callback interface FilesEventListener {
+    void on_upload_progress(bytes file_hash, u64 bytes_sent, u64 total_bytes);
+    void on_upload_complete(bytes file_hash);
+    void on_upload_error(bytes file_hash, string error);
+    void on_download_progress(bytes file_hash, u64 bytes_received, u64 total_bytes);
+    void on_download_complete(bytes file_hash, string file_path);
+    void on_download_error(bytes file_hash, string error);
 };
 
 /// Receives mediator (group-chat server) events.
@@ -513,4 +530,51 @@ interface MediatorNode {
 
     [Throws=MimirError]
     sequence<GroupMember> get_members(bytes mediator_pubkey, i64 chat_id);
+};
+
+// ── Files server node ─────────────────────────────────────────────────────────
+
+/// Manages encrypted file uploads and downloads through file servers.
+///
+/// Shares the Yggdrasil identity from an existing `PeerNode`.
+/// All methods are thread-safe.
+interface FilesNode {
+    /// Create a new FilesNode.
+    ///
+    /// `peer_node`       – Running PeerNode (its Ygg node + runtime are shared).
+    /// `files_port`      – Port file servers listen on.
+    /// `event_listener`  – Receives upload/download progress events.
+    [Throws=MimirError]
+    constructor(
+        PeerNode               peer_node,
+        u16                    files_port,
+        FilesEventListener     event_listener
+    );
+
+    /// Upload a file to the server.
+    /// Returns the 32-byte SHA-256 hash of the encrypted file.
+    ///
+    /// `server_pubkey`   – 32-byte public key of the file server.
+    /// `file_path`       – Path to the plaintext file on disk.
+    /// `message_guid`    – Client-generated message GUID for this file.
+    /// `encryption_key`  – 32-byte ChaCha20-Poly1305 key for encryption.
+    [Throws=MimirError]
+    bytes upload_file(bytes server_pubkey, string file_path, i64 message_guid, bytes encryption_key);
+
+    /// Download a file from the server and decrypt it to `dest_path`.
+    ///
+    /// `server_pubkey`   – 32-byte public key of the file server.
+    /// `file_hash`       – 32-byte SHA-256 hash of the encrypted file.
+    /// `message_guid`    – Client-generated message GUID.
+    /// `dest_path`       – Where to write the decrypted file.
+    /// `encryption_key`  – 32-byte ChaCha20-Poly1305 key for decryption.
+    [Throws=MimirError]
+    void download_file(bytes server_pubkey, bytes file_hash, i64 message_guid, string dest_path, bytes encryption_key);
+
+    /// Query file metadata from the server.
+    [Throws=MimirError]
+    FileInfo file_info(bytes server_pubkey, bytes file_hash);
+
+    /// Stop all cached file server connections.
+    void stop();
 };

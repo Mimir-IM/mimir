@@ -108,6 +108,17 @@ pub const TAG_ACCEPTED:    u8 = 0x35;
 pub const TAG_LAST_UPDATE: u8 = 0x36;
 pub const TAG_LAST_SEEN:   u8 = 0x37;
 
+// ── Files server TLV tags ───────────────────────────────────────────────────
+pub const TAG_FILE_HASH:  u8 = 0x40;
+pub const TAG_OFFSET:     u8 = 0x41;
+pub const TAG_TOTAL_SIZE: u8 = 0x42;
+pub const TAG_CHUNK_DATA: u8 = 0x43;
+
+// ── Files server command codes ──────────────────────────────────────────────
+pub const CMD_FILE_UPLOAD:   u8 = 0x10;
+pub const CMD_FILE_DOWNLOAD: u8 = 0x11;
+pub const CMD_FILE_INFO:     u8 = 0x12;
+
 // ── Varint (protobuf-style, up to 4 bytes for u32) ───────────────────────────
 
 /// Append a variable-length unsigned integer to `buf`.

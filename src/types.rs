@@ -65,6 +65,13 @@ pub struct GroupMemberInfo {
     pub timestamp:      i64,
 }
 
+/// File metadata returned by `FilesNode::file_info`.
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub total_size: u64,
+    pub message_guid: i64,
+}
+
 /// Opaque encrypted member info blob returned by `on_member_info_request`.
 /// Kotlin encrypts the profile (nickname + info + avatar) with the chat shared key
 /// and returns the ciphertext so Rust can send it to the mediator.

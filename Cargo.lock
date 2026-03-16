@@ -1045,7 +1045,8 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
 name = "ironwood"
-version = "0.1.1"
+version = "0.1.2"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?tag=v0.1.2#a66c396dcc13bbd7fd96a7db3cc49440fefe2f88"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1166,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "mimir"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -1184,7 +1185,6 @@ dependencies = [
  "uniffi",
  "x25519-dalek",
  "ygg_stream",
- "yggdrasil",
 ]
 
 [[package]]
@@ -3128,7 +3128,8 @@ dependencies = [
 
 [[package]]
 name = "ygg_stream"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/Revertron/ygg_stream?tag=v0.1.1#8826e5c24fafe510c07e10098d1c7e95fcc5720f"
 dependencies = [
  "bytes",
  "ed25519-dalek",
@@ -3148,7 +3149,8 @@ dependencies = [
 
 [[package]]
 name = "yggdrasil"
-version = "0.1.1"
+version = "0.1.2"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?tag=v0.1.2#a66c396dcc13bbd7fd96a7db3cc49440fefe2f88"
 dependencies = [
  "blake2",
  "comfy-table",
