@@ -3128,8 +3128,8 @@ dependencies = [
 
 [[package]]
 name = "ygg_stream"
-version = "0.1.1"
-source = "git+https://github.com/Revertron/ygg_stream?tag=v0.1.1#8826e5c24fafe510c07e10098d1c7e95fcc5720f"
+version = "0.1.2"
+source = "git+https://github.com/Revertron/ygg_stream?tag=v0.1.2#c6fd8de580c2d47ed4804481b0ad2679f7e1117f"
 dependencies = [
  "bytes",
  "ed25519-dalek",
@@ -3143,7 +3143,6 @@ dependencies = [
  "tracing",
  "tracing-android",
  "tracing-subscriber",
- "uniffi",
  "yggdrasil",
 ]
 

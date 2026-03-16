@@ -559,7 +559,8 @@ impl PeerNode {
             // Resolve the permanent pubkey to ephemeral Yggdrasil routing key(s).
             // Try cached first; query trackers if cache is empty.
             let mut ephemeral_keys = state.resolver.get_cached(&key);
-            if ephemeral_keys.is_empty() {
+            let used_cache = !ephemeral_keys.is_empty();
+            if !used_cache {
                 ephemeral_keys = state.resolver.query_trackers(&key).await;
             }
             // Fall back to treating the permanent key as the routing key directly
@@ -568,12 +569,11 @@ impl PeerNode {
                 ephemeral_keys = vec![key];
             }
 
-            for eph_key in ephemeral_keys {
-                match state.node.connect(&eph_key, state.peer_port).await {
+            for eph_key in &ephemeral_keys {
+                match state.node.connect(eph_key, state.peer_port).await {
                     Ok(conn) => {
                         let ctx = state.make_ctx();
                         let conn = Arc::new(conn);
-                        // Identify the peer by their permanent pubkey for auth + map key.
                         if let Some(tx) = run_outbound(conn, key, ctx).await {
                             state.register_peer(key, tx);
                         }
@@ -589,6 +589,39 @@ impl PeerNode {
                     }
                 }
             }
+
+            // All cached addresses failed — the peer likely restarted and got
+            // a new ephemeral key.  Invalidate the stale cache, query trackers
+            // for fresh addresses, and retry once.
+            if used_cache {
+                tracing::info!("connect_to_peer {}: cached addresses failed, querying trackers", hex::encode(&key[..4]));
+                state.resolver.invalidate(&key);
+                let fresh_keys = state.resolver.query_trackers(&key).await;
+                // Only try keys we haven't already tried.
+                let already_tried: std::collections::HashSet<[u8; 32]> =
+                    ephemeral_keys.into_iter().collect();
+                let new_keys: Vec<[u8; 32]> = fresh_keys
+                    .into_iter()
+                    .filter(|k| !already_tried.contains(k))
+                    .collect();
+
+                for eph_key in &new_keys {
+                    match state.node.connect(eph_key, state.peer_port).await {
+                        Ok(conn) => {
+                            let ctx = state.make_ctx();
+                            let conn = Arc::new(conn);
+                            if let Some(tx) = run_outbound(conn, key, ctx).await {
+                                state.register_peer(key, tx);
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("connect_to_peer {}: fresh eph {} failed: {}", hex::encode(&key[..4]), hex::encode(&eph_key[..4]), e);
+                        }
+                    }
+                }
+            }
+
             tracing::error!("connect_to_peer {}: all addresses exhausted", hex::encode(&key[..4]));
         });
         Ok(())

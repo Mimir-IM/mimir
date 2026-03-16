@@ -103,6 +103,12 @@ impl Resolver {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
+    /// Remove the cached entry for `permanent_pubkey` so the next resolution
+    /// goes to the trackers.
+    pub fn invalidate(&self, permanent_pubkey: &[u8; 32]) {
+        self.cache.lock().unwrap().remove(permanent_pubkey);
+    }
+
     /// Return unexpired cached ephemeral keys for `permanent_pubkey`, sorted
     /// by priority (highest first).
     pub fn get_cached(&self, permanent_pubkey: &[u8; 32]) -> Vec<[u8; 32]> {
