@@ -61,13 +61,23 @@ impl MediatorManager {
     pub async fn get_or_create(self: &Arc<Self>, mediator_pubkey: &[u8; 32]) -> Result<MediatorClient, MimirError> {
         let hex = hex::encode(mediator_pubkey);
 
+        let hex8 = &hex[..8];
+
         // Fast path: live connection already exists.
         {
-            let map = self.clients.lock().unwrap();
+            let mut map = self.clients.lock().unwrap();
             if let Some(client) = map.get(&hex) {
-                return Ok(client.clone());
+                if !client.is_disconnected() {
+                    tracing::debug!("mediator {hex8}: get_or_create fast-path hit (live client)");
+                    return Ok(client.clone());
+                }
+                // Stale client — remove it so we fall through to reconnect.
+                tracing::warn!("mediator {hex8}: get_or_create found stale client, removing");
+                map.remove(&hex);
             }
         }
+
+        tracing::info!("mediator {hex8}: get_or_create → new connection needed");
 
         // Acquire a per-key async lock to serialize concurrent connect attempts.
         let key_lock = {
@@ -79,9 +89,14 @@ impl MediatorManager {
 
         // Double-check: another task may have connected while we were waiting.
         {
-            let map = self.clients.lock().unwrap();
+            let mut map = self.clients.lock().unwrap();
             if let Some(client) = map.get(&hex) {
-                return Ok(client.clone());
+                if !client.is_disconnected() {
+                    tracing::debug!("mediator {hex8}: get_or_create double-check hit (live client)");
+                    return Ok(client.clone());
+                }
+                tracing::warn!("mediator {hex8}: get_or_create double-check found stale client, removing");
+                map.remove(&hex);
             }
         }
 
@@ -89,6 +104,9 @@ impl MediatorManager {
     }
 
     async fn do_connect(self: &Arc<Self>, mediator_pubkey: &[u8; 32], hex: &str) -> Result<MediatorClient, MimirError> {
+        let hex8 = &hex[..8];
+        tracing::info!("mediator {hex8}: do_connect starting");
+
         // Wrap the user's listener so that on_disconnected also schedules reconnect.
         let wrapped: Arc<dyn MediatorEventListener> = Arc::new(ReconnectListener {
             inner: Arc::clone(&self.listener),
@@ -104,46 +122,21 @@ impl MediatorManager {
             wrapped,
         ).await?;
 
-        // Gather chats to resubscribe: locally-remembered (from explicit subscribe()
-        // calls) merged with the server's membership list.
-        let mut chat_ids: HashSet<i64> = self.subscriptions.lock().unwrap()
-            .get(hex).cloned().unwrap_or_default();
-
-        match client.get_user_chats().await {
-            Ok(server_chats) => chat_ids.extend(server_chats),
-            Err(e) => tracing::warn!("mediator {}: get_user_chats failed: {e}", &hex[..8]),
-        }
-
-        // Insert atomically while checking that the connection hasn't already died.
+         // Insert atomically while checking that the connection hasn't already died.
         {
             let mut map = self.clients.lock().unwrap();
             if client.is_disconnected() {
                 // Reader/ping detected disconnect before we finished setup — retry.
-                return Err(MimirError::Connection(
-                    "connection dropped immediately after auth".into()
-                ));
+                tracing::error!("mediator {hex8}: connection dropped during setup (before insert)");
+                return Err(MimirError::Connection("connection dropped immediately after auth".into()));
             }
             map.insert(hex.to_string(), client.clone());
         }
 
         // Reset reconnect counter on successful connection.
         self.attempts.lock().unwrap().remove(hex);
-
         // Notify the app FIRST — client is in the map so any mimir call from the
-        // callback hits the fast path in get_or_create (no key-lock contention).
-        // The app's onConnected handler typically subscribes to all its known chats,
-        // which fires on_subscribed once per chat with the correct last_message_id.
         self.listener.on_connected(mediator_pubkey.to_vec());
-
-        // Silently re-subscribe as a safety net (idempotent on the server).
-        // We do NOT fire on_subscribed here — the app's onConnected already called
-        // subscribe() for each chat, which fires on_subscribed with proper context.
-        // Firing it again here would cause double syncMissedMessages runs.
-        for chat_id in chat_ids {
-            if let Err(e) = client.subscribe(chat_id).await {
-                tracing::warn!("mediator {}: auto-subscribe chat {chat_id} failed: {e}", &hex[..8]);
-            }
-        }
 
         Ok(client)
     }
@@ -169,12 +162,17 @@ impl MediatorManager {
     /// `disconnected` flag set — this prevents a stale reader from evicting a
     /// freshly-connected replacement client.  Returns `true` if removed.
     fn remove_client(&self, hex: &str) -> bool {
+        let hex8 = &hex[..8.min(hex.len())];
         let mut map = self.clients.lock().unwrap();
         if let Some(client) = map.get(hex) {
             if client.is_disconnected() {
                 map.remove(hex);
+                tracing::info!("mediator {hex8}: removed dead client from map");
                 return true;
             }
+            tracing::debug!("mediator {hex8}: remove_client skipped — client still alive");
+        } else {
+            tracing::debug!("mediator {hex8}: remove_client — not in map");
         }
         false
     }

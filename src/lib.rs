@@ -6,6 +6,7 @@ pub mod error;
 pub mod files;
 pub mod mediator;
 pub mod peer;
+pub mod tlv;
 pub mod types;
 
 pub use callbacks::{FilesEventListener, InfoProvider, MediatorEventListener, PeerEventListener};

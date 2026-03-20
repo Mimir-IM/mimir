@@ -216,12 +216,12 @@ callback interface PeerEventListener {
 /// Receives file server upload/download events.
 /// All callbacks are invoked from Rust async tasks — must return quickly.
 callback interface FilesEventListener {
-    void on_upload_progress(bytes file_hash, u64 bytes_sent, u64 total_bytes);
-    void on_upload_complete(bytes file_hash);
-    void on_upload_error(bytes file_hash, string error);
-    void on_download_progress(bytes file_hash, u64 bytes_received, u64 total_bytes);
-    void on_download_complete(bytes file_hash, string file_path);
-    void on_download_error(bytes file_hash, string error);
+    void on_upload_progress(bytes file_hash, i64 message_guid, u64 bytes_sent, u64 total_bytes);
+    void on_upload_complete(bytes file_hash, i64 message_guid);
+    void on_upload_error(bytes file_hash, i64 message_guid, string error);
+    void on_download_progress(bytes file_hash, i64 message_guid, u64 bytes_received, u64 total_bytes);
+    void on_download_complete(bytes file_hash, i64 message_guid, string file_path);
+    void on_download_error(bytes file_hash, i64 message_guid, string error);
 };
 
 /// Receives mediator (group-chat server) events.

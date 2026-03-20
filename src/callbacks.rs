@@ -69,12 +69,12 @@ pub trait PeerEventListener: Send + Sync {
 /// Receives file server upload/download events.
 /// All callbacks are invoked from Rust async tasks — must return quickly.
 pub trait FilesEventListener: Send + Sync {
-    fn on_upload_progress(&self, file_hash: Vec<u8>, bytes_sent: u64, total_bytes: u64);
-    fn on_upload_complete(&self, file_hash: Vec<u8>);
-    fn on_upload_error(&self, file_hash: Vec<u8>, error: String);
-    fn on_download_progress(&self, file_hash: Vec<u8>, bytes_received: u64, total_bytes: u64);
-    fn on_download_complete(&self, file_hash: Vec<u8>, file_path: String);
-    fn on_download_error(&self, file_hash: Vec<u8>, error: String);
+    fn on_upload_progress(&self, file_hash: Vec<u8>, message_guid: i64, bytes_sent: u64, total_bytes: u64);
+    fn on_upload_complete(&self, file_hash: Vec<u8>, message_guid: i64);
+    fn on_upload_error(&self, file_hash: Vec<u8>, message_guid: i64, error: String);
+    fn on_download_progress(&self, file_hash: Vec<u8>, message_guid: i64, bytes_received: u64, total_bytes: u64);
+    fn on_download_complete(&self, file_hash: Vec<u8>, message_guid: i64, file_path: String);
+    fn on_download_error(&self, file_hash: Vec<u8>, message_guid: i64, error: String);
 }
 
 /// Receives mediator (group-chat server) events.

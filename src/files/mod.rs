@@ -69,13 +69,7 @@ impl FilesNode {
     /// 2. SHA-256 the encrypted temp file
     /// 3. Upload in 1 MB chunks
     /// 4. Clean up temp file
-    pub fn upload_file(
-        &self,
-        server_pubkey: Vec<u8>,
-        file_path: String,
-        message_guid: i64,
-        encryption_key: Vec<u8>,
-    ) -> Result<Vec<u8>, MimirError> {
+    pub fn upload_file(&self,server_pubkey: Vec<u8>, file_path: String, message_guid: i64, encryption_key: Vec<u8>) -> Result<Vec<u8>, MimirError> {
         let key = to_key32(&server_pubkey)?;
         let enc_key = to_key32(&encryption_key)
             .map_err(|_| MimirError::Crypto("encryption key must be 32 bytes".into()))?;
@@ -94,11 +88,11 @@ impl FilesNode {
 
             match result {
                 Ok(hash) => {
-                    self.listener.on_upload_complete(hash.to_vec());
+                    self.listener.on_upload_complete(hash.to_vec(), message_guid);
                     Ok(hash.to_vec())
                 }
                 Err(e) => {
-                    self.listener.on_upload_error(Vec::new(), e.to_string());
+                    self.listener.on_upload_error(Vec::new(), message_guid, e.to_string());
                     Err(e)
                 }
             }
@@ -106,14 +100,7 @@ impl FilesNode {
     }
 
     /// Download a file from the server and decrypt it to `dest_path`.
-    pub fn download_file(
-        &self,
-        server_pubkey: Vec<u8>,
-        file_hash: Vec<u8>,
-        message_guid: i64,
-        dest_path: String,
-        encryption_key: Vec<u8>,
-    ) -> Result<(), MimirError> {
+    pub fn download_file(&self,server_pubkey: Vec<u8>, file_hash: Vec<u8>, message_guid: i64, dest_path: String, encryption_key: Vec<u8>) -> Result<(), MimirError> {
         let key = to_key32(&server_pubkey)?;
         let hash = to_key32(&file_hash)
             .map_err(|_| MimirError::Protocol("file hash must be 32 bytes".into()))?;
@@ -132,11 +119,11 @@ impl FilesNode {
 
             match result {
                 Ok(()) => {
-                    self.listener.on_download_complete(file_hash, dest_path);
+                    self.listener.on_download_complete(file_hash, message_guid, dest_path);
                     Ok(())
                 }
                 Err(e) => {
-                    self.listener.on_download_error(file_hash, e.to_string());
+                    self.listener.on_download_error(file_hash, message_guid, e.to_string());
                     Err(e)
                 }
             }
@@ -144,11 +131,7 @@ impl FilesNode {
     }
 
     /// Query file metadata from the server.
-    pub fn file_info(
-        &self,
-        server_pubkey: Vec<u8>,
-        file_hash: Vec<u8>,
-    ) -> Result<FileInfo, MimirError> {
+    pub fn file_info(&self,server_pubkey: Vec<u8>, file_hash: Vec<u8>) -> Result<FileInfo, MimirError> {
         let key = to_key32(&server_pubkey)?;
         let hash = to_key32(&file_hash)
             .map_err(|_| MimirError::Protocol("file hash must be 32 bytes".into()))?;
@@ -194,13 +177,7 @@ impl FilesNode {
     }
 
     /// Hash the encrypted file, then upload it in chunks.
-    async fn hash_and_upload(
-        &self,
-        server_pubkey: &[u8; 32],
-        enc_path: &str,
-        enc_size: u64,
-        message_guid: i64,
-    ) -> Result<[u8; 32], MimirError> {
+    async fn hash_and_upload(&self,server_pubkey: &[u8; 32], enc_path: &str, enc_size: u64, message_guid: i64) -> Result<[u8; 32], MimirError> {
         // SHA-256 the encrypted file
         let hash = sha256_file(enc_path).await?;
 
@@ -220,7 +197,7 @@ impl FilesNode {
             }
             client.upload_chunk(&hash, message_guid, offset, enc_size, &buf[..n]).await?;
             offset += n as u64;
-            self.listener.on_upload_progress(hash.to_vec(), offset, enc_size);
+            self.listener.on_upload_progress(hash.to_vec(), message_guid, offset, enc_size);
         }
 
         Ok(hash)
@@ -256,7 +233,7 @@ impl FilesNode {
             f.write_all(&chunk).await
                 .map_err(|e| MimirError::Io(format!("write temp file: {e}")))?;
             offset += chunk.len() as u64;
-            self.listener.on_download_progress(hash.to_vec(), offset, total_size);
+            self.listener.on_download_progress(hash.to_vec(), message_guid, offset, total_size);
         }
 
         f.flush().await.map_err(|e| MimirError::Io(format!("flush: {e}")))?;

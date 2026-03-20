@@ -62,8 +62,14 @@ impl MediatorClient {
     ///
     /// Returns the ready-to-use client or an error.
     pub async fn connect(node: &AsyncNode, mediator_pubkey: [u8; 32], port: u16, sk: Arc<SigningKey>, listener: Arc<dyn MediatorEventListener>) -> Result<Self, MimirError> {
+        let hex8 = &hex::encode(mediator_pubkey)[..8];
+        tracing::info!("mediator {hex8}: dialing port {port}");
         let conn = node.connect(&mediator_pubkey, port).await
-            .map_err(|e| MimirError::Connection(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!("mediator {hex8}: dial failed: {e}");
+                MimirError::Connection(e.to_string())
+            })?;
+        tracing::info!("mediator {hex8}: stream established, sending handshake");
         let conn = Arc::new(conn);
 
         // Handshake: send [VERSION][PROTO_CLIENT]
@@ -98,7 +104,16 @@ impl MediatorClient {
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
-                    _ = stop_rx.recv() => {},
+                    _ = stop_rx.recv() => {
+                        // Stopped externally (request timeout aborted the conn,
+                        // or ping loop, or explicit stop).  Mark disconnected
+                        // and notify the listener so reconnect is scheduled.
+                        if !c.disconnected.swap(true, Ordering::SeqCst) {
+                            let hex8 = &hex::encode(c.mediator_pubkey)[..8];
+                            tracing::warn!("mediator {hex8}: reader stopped via stop signal, firing on_disconnected");
+                            listener.on_disconnected(c.mediator_pubkey.to_vec());
+                        }
+                    },
                     _ = c.reader_loop(listener.as_ref()) => {},
                 }
                 // Fail any still-waiting requests.
@@ -112,10 +127,13 @@ impl MediatorClient {
         }
 
         // Authenticate now that the reader is running to process server responses.
+        tracing::info!("mediator {hex8}: authenticating");
         if let Err(e) = client.authenticate(&sk).await {
+            tracing::error!("mediator {hex8}: auth failed: {e}");
             client.stop(); // shut down the reader task we just spawned
             return Err(e);
         }
+        tracing::info!("mediator {hex8}: auth OK, spawning ping task");
 
         // Spawn ping task (needs listener so it can fire on_disconnected on timeout).
         {
@@ -213,6 +231,7 @@ impl MediatorClient {
 
     /// Returns the list of chat IDs this user is a member of on the server.
     /// Used internally after (re)connect to resubscribe to all chats.
+    #[allow(dead_code)]
     pub(super) async fn get_user_chats(&self) -> Result<Vec<i64>, MimirError> {
         let resp = self.request(CMD_GET_USER_CHATS, &[]).await?;
         if resp.status != STATUS_OK {
@@ -446,9 +465,10 @@ impl MediatorClient {
         }.await;
 
         if let Some(e) = write_err {
-            // RST: immediately sets stream state=Closed and wakes the reader
-            // task, so reader_loop exits and fires on_disconnected promptly.
+            let hex8 = &hex::encode(self.mediator_pubkey)[..8];
+            tracing::warn!("mediator {hex8}: write failed cmd=0x{cmd:02x} req={req_id}: {e}");
             self.conn.abort().await;
+            let _ = self.stop_tx.send(()); // wake reader task in case abort didn't
             self.pending.lock().await.remove(&req_id);
             return Err(e);
         }
@@ -457,14 +477,18 @@ impl MediatorClient {
         match time::timeout(timeout_dur, rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => {
+                let hex8 = &hex::encode(self.mediator_pubkey)[..8];
+                tracing::warn!("mediator {hex8}: conn closed during request cmd=0x{cmd:02x} req={req_id}");
+                self.conn.abort().await;
+                let _ = self.stop_tx.send(()); // wake reader task
                 self.pending.lock().await.remove(&req_id);
                 Err(MimirError::Connection("connection closed during request".into()))
             }
             Err(_timeout) => {
-                // RST instead of graceful FIN: poll_read only unblocks on
-                // Closed, not Closing, so a FIN-based close leaves the reader
-                // task stuck forever and on_disconnected never fires.
+                let hex8 = &hex::encode(self.mediator_pubkey)[..8];
+                tracing::warn!("mediator {hex8}: request timed out cmd=0x{cmd:02x} req={req_id} after {timeout_dur:?}");
                 self.conn.abort().await;
+                let _ = self.stop_tx.send(()); // wake reader task in case abort didn't
                 self.pending.lock().await.remove(&req_id);
                 Err(MimirError::Connection(format!(
                     "request cmd=0x{cmd:02x} timed out"
@@ -476,6 +500,8 @@ impl MediatorClient {
     // ── Internal: reader loop ──────────────────────────────────────────────────
 
     async fn reader_loop(&self, listener: &dyn MediatorEventListener) {
+        let hex8 = &hex::encode(self.mediator_pubkey)[..8];
+        tracing::info!("mediator {hex8}: reader loop started");
         loop {
             // last_activity_ms is updated inside read_response after every
             // partial read, so the ping loop sees the connection as alive
@@ -483,9 +509,10 @@ impl MediatorClient {
             let resp = match read_response(&self.conn, &self.last_activity_ms).await {
                 Ok(r)  => r,
                 Err(e) => {
-                    tracing::error!("mediator reader error: {e}");
+                    tracing::error!("mediator {hex8}: reader error: {e}");
                     // Use swap to ensure only one of reader/ping fires on_disconnected.
                     if !self.disconnected.swap(true, Ordering::SeqCst) {
+                        tracing::warn!("mediator {hex8}: reader firing on_disconnected");
                         listener.on_disconnected(self.mediator_pubkey.to_vec());
                     }
                     return;
@@ -622,25 +649,33 @@ impl MediatorClient {
     // ── Internal: ping loop ────────────────────────────────────────────────────
 
     async fn ping_loop(&self, listener: &dyn MediatorEventListener) {
-        let mut interval = time::interval(PING_INTERVAL);
-        interval.tick().await; // skip the immediate first tick
+        let hex8 = &hex::encode(self.mediator_pubkey)[..8];
+        let ping_ms = PING_INTERVAL.as_millis() as u64;
         loop {
-            interval.tick().await;
             let elapsed = now_ms().saturating_sub(
                 self.last_activity_ms.load(Ordering::Relaxed)
             );
-            if elapsed >= PING_INTERVAL.as_millis() as u64 {
+            if elapsed >= ping_ms {
+                tracing::debug!("mediator {hex8}: sending ping (idle {elapsed}ms)");
                 if let Err(e) = self.request(CMD_PING, &[]).await {
-                    tracing::error!("mediator ping failed: {e}");
+                    tracing::error!("mediator {hex8}: ping failed after {elapsed}ms idle: {e}");
                     // Zombie connection detected — notify and stop everything.
                     if !self.disconnected.swap(true, Ordering::SeqCst) {
+                        tracing::warn!("mediator {hex8}: ping loop firing on_disconnected");
                         listener.on_disconnected(self.mediator_pubkey.to_vec());
                     }
                     // Stop the reader task too (it may be blocked on a hung read).
                     let _ = self.stop_tx.send(());
                     return;
                 }
+                tracing::debug!("mediator {hex8}: pong OK");
             }
+            // Sleep only for the remaining time until PING_INTERVAL since last activity.
+            let elapsed = now_ms().saturating_sub(
+                self.last_activity_ms.load(Ordering::Relaxed)
+            );
+            let remaining = ping_ms.saturating_sub(elapsed);
+            time::sleep(Duration::from_millis(remaining.max(1000))).await;
         }
     }
 

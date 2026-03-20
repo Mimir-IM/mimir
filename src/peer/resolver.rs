@@ -1,29 +1,29 @@
-//! Tracker-based peer resolver.
+//! Tracker-based peer resolver (V2 TLV protocol).
 //!
 //! Implements the lightweight UDP-over-Yggdrasil tracker protocol used to map
 //! a user's permanent Ed25519 pubkey to their current ephemeral Yggdrasil node
 //! pubkey ("address").
 //!
-//! ## Protocol frame layout
+//! ## Protocol frame layout (V2)
 //!
 //! **Client → tracker (request):**
 //! ```text
-//! [VERSION:1][nonce:4 BE][CMD:1][payload...]
+//! [VERSION:1][nonce:4 BE][CMD:1][TLV payload...]
 //! ```
 //!
 //! **Tracker → client (response):**
 //! ```text
-//! [nonce:4 BE][CMD:1][payload...]
+//! [nonce:4 BE][CMD:1][TLV payload...]
 //! ```
 //!
-//! ### CMD_GET_ADDRS (0x01) — resolve a permanent pubkey to ephemeral addr(s)
-//! Request payload : `[permanent_pubkey:32]`
-//! Response payload: `[count:1]` + count × `[eph_key:32][sig:64][priority:1][client_id:4 BE][ttl:8 BE]`
-//! Signature       : `Ed25519_sign(permanent_sk, eph_key_bytes)` — verified client-side
+//! ### CMD_ANNOUNCE (0x00)
+//! Request TLV : TAG_USER_PUB, TAG_NODE_PUB, TAG_SIGNATURE, TAG_PRIORITY, TAG_CLIENT_ID
+//! Response TLV: TAG_TTL_SECS
 //!
-//! ### CMD_ANNOUNCE (0x00) — register our ephemeral addr with the tracker
-//! Request payload : `[perm_pubkey:32][priority:1][client_id:4 BE][eph_addr:32][sig:64]`
-//! Response payload: `[ttl:8 BE]`
+//! ### CMD_GET_ADDRS (0x01)
+//! Request TLV : TAG_USER_PUB
+//! Response TLV: TAG_COUNT, N × TAG_RECORD (each a nested TLV with
+//!               TAG_NODE_PUB, TAG_SIGNATURE, TAG_PRIORITY, TAG_CLIENT_ID, TAG_EXPIRES_MS)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,10 +33,11 @@ use ed25519_dalek::SigningKey;
 use ygg_stream::AsyncNode;
 
 use crate::crypto::{sign, verify};
+use crate::tlv::*;
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const CMD_ANNOUNCE: u8 = 0x00;
 const CMD_GET_ADDRS: u8 = 0x01;
 
@@ -46,6 +47,18 @@ const RECV_TIMEOUT_MS: i64 = 5_000;
 /// Maximum number of received datagrams to scan when matching a nonce
 /// (guards against stale/unrelated datagrams piling up).
 const MAX_RECV_LOOPS: usize = 16;
+
+// ── Tracker TLV tag constants ────────────────────────────────────────────────
+
+const TAG_USER_PUB:   u8 = 0x01;
+const TAG_NODE_PUB:   u8 = 0x02;
+const TAG_SIGNATURE:  u8 = 0x03;
+const TAG_PRIORITY:   u8 = 0x05;
+const TAG_CLIENT_ID:  u8 = 0x06;
+const TAG_TTL_SECS:   u8 = 0x07;
+const TAG_EXPIRES_MS: u8 = 0x08;
+const TAG_COUNT:      u8 = 0x0B;
+const TAG_RECORD:     u8 = 0x0C;
 
 // ── Tracker address ───────────────────────────────────────────────────────────
 
@@ -188,19 +201,22 @@ impl Resolver {
         let public_key  = self.signing_key.verifying_key().to_bytes();
         tracing::info!("Announcing addr {} for {}", hex::encode(&our_addr), hex::encode(&public_key[..8]));
 
-        // Build announce frame:
-        // [VERSION:1][nonce:4][CMD_ANNOUNCE:1]
-        // [perm_pubkey:32][priority:1][client_id:4 BE][eph_addr:32][sig:64]
+        // Build V2 TLV announce frame:
+        // [VERSION:1][nonce:4][CMD_ANNOUNCE:1][TLV payload]
         let nonce = random_nonce();
-        let mut frame = Vec::with_capacity(1 + 4 + 1 + 32 + 1 + 4 + 32 + 64);
+
+        let mut tlv_payload = Vec::new();
+        write_tlv(&mut tlv_payload, TAG_USER_PUB,  &public_key);
+        write_tlv(&mut tlv_payload, TAG_NODE_PUB,  &our_addr);
+        write_tlv(&mut tlv_payload, TAG_SIGNATURE, &sig);
+        write_tlv_u8(&mut tlv_payload, TAG_PRIORITY, 1);
+        write_tlv_u32(&mut tlv_payload, TAG_CLIENT_ID, 1);
+
+        let mut frame = Vec::with_capacity(1 + 4 + 1 + tlv_payload.len());
         frame.push(VERSION);
         frame.extend_from_slice(&nonce);
         frame.push(CMD_ANNOUNCE);
-        frame.extend_from_slice(&public_key);          // permanent pubkey
-        frame.push(1u8);                        // priority
-        frame.extend_from_slice(&1u32.to_be_bytes()); // client_id = 1
-        frame.extend_from_slice(&our_addr);           // ephemeral addr
-        frame.extend_from_slice(&sig);
+        frame.extend_from_slice(&tlv_payload);
 
         for tracker in &self.trackers {
             // Pre-register listener on tracker.port before sending so we don't miss
@@ -211,14 +227,22 @@ impl Resolver {
                 tracing::warn!("resolver: announce send to {} failed: {e}", hex::encode(&tracker.pubkey[..4]));
                 continue;
             }
-            // Best-effort read of TTL response (not required for correctness).
+            // Best-effort read of TTL response.
             match self.recv_matching(&tracker.pubkey, &nonce, CMD_ANNOUNCE, tracker.port).await {
-                Ok(payload) if payload.len() >= 8 => {
-                    let ttl = i64::from_be_bytes(payload[..8].try_into().unwrap());
-                    tracing::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
-                    return Ok(ttl);
+                Ok(payload) => {
+                    match parse_tlvs(&payload) {
+                        Ok(tlvs) => {
+                            if let Ok(ttl) = tlvs.get_u64(TAG_TTL_SECS) {
+                                let ttl = ttl as i64;
+                                tracing::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
+                                return Ok(ttl);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("resolver: announce response parse error from {}: {e}", hex::encode(&tracker.pubkey[..4]));
+                        }
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => {
                     tracing::debug!("resolver: no announce ack from {}: {e}", hex::encode(&tracker.pubkey[..4]));
                 }
@@ -232,12 +256,15 @@ impl Resolver {
     async fn get_addrs_from(&self, tracker: &TrackerEntry, permanent_pubkey: &[u8; 32]) -> Result<Vec<CachedPeer>, String> {
         let nonce = random_nonce();
 
-        // GET_ADDRS request: [VERSION:1][nonce:4][CMD_GET_ADDRS:1][permanent_pubkey:32]
-        let mut frame = Vec::with_capacity(1 + 4 + 1 + 32);
+        // GET_ADDRS V2 request: [VERSION:1][nonce:4][CMD_GET_ADDRS:1][TLV: TAG_USER_PUB]
+        let mut tlv_payload = Vec::new();
+        write_tlv(&mut tlv_payload, TAG_USER_PUB, permanent_pubkey);
+
+        let mut frame = Vec::with_capacity(1 + 4 + 1 + tlv_payload.len());
         frame.push(VERSION);
         frame.extend_from_slice(&nonce);
         frame.push(CMD_GET_ADDRS);
-        frame.extend_from_slice(permanent_pubkey);
+        frame.extend_from_slice(&tlv_payload);
 
         // Pre-register listener on tracker.port before sending so we don't miss
         // the response. The tracker has no source-port concept and responds on
@@ -298,8 +325,10 @@ impl Resolver {
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
-/// Parse a GET_ADDRS response payload:
-/// `[count:1]` + count × `[eph_key:32][sig:64][priority:1][client_id:4 BE][ttl:8 BE]`
+/// Parse a V2 GET_ADDRS response TLV payload:
+/// - TAG_COUNT: number of records
+/// - TAG_RECORD (repeated): nested TLV with TAG_NODE_PUB, TAG_SIGNATURE,
+///   TAG_PRIORITY, TAG_CLIENT_ID, TAG_EXPIRES_MS
 ///
 /// Each peer record is signature-verified against `permanent_pubkey`.
 /// Invalid records are silently skipped.
@@ -308,42 +337,85 @@ fn parse_get_addrs_response(payload: &[u8], permanent_pubkey: &[u8; 32]) -> Resu
         return Ok(vec![]);
     }
 
-    let count = payload[0] as usize;
-    const RECORD: usize = 32 + 64 + 1 + 4 + 8; // 109 bytes per peer
+    let multi = parse_tlvs_multi(payload)
+        .map_err(|e| format!("GET_ADDRS: TLV parse error: {e}"))?;
 
-    if payload.len() < 1 + count * RECORD {
+    // Extract count (single-value tag).
+    let count = match multi.get(&TAG_COUNT) {
+        Some(vals) if !vals.is_empty() => {
+            if vals[0].len() != 1 {
+                return Err("GET_ADDRS: TAG_COUNT must be 1 byte".into());
+            }
+            vals[0][0] as usize
+        }
+        _ => return Ok(vec![]),
+    };
+
+    if count == 0 {
+        return Ok(vec![]);
+    }
+
+    let records = match multi.get(&TAG_RECORD) {
+        Some(r) => r,
+        None => return Err("GET_ADDRS: expected TAG_RECORD entries".into()),
+    };
+
+    if records.len() < count {
         return Err(format!(
-            "GET_ADDRS: short payload ({} bytes for {count} peers)",
-            payload.len()
+            "GET_ADDRS: count={count} but only {} TAG_RECORD entries",
+            records.len()
         ));
     }
 
-    let now    = Instant::now();
+    let now = Instant::now();
     let mut peers = Vec::with_capacity(count);
-    let mut off = 1usize;
 
-    for _ in 0..count {
-        let eph_key:   [u8; 32] = payload[off..off+32].try_into().unwrap(); off += 32;
-        let sig = &payload[off..off + 64];
-        off += 64;
-        let priority = payload[off];
-        off += 1;
-        let client_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
-        off += 4;
-        let ttl_secs = u64::from_be_bytes(payload[off..off + 8].try_into().unwrap());
-        off += 8;
+    for record_data in records.iter().take(count) {
+        let inner = match parse_tlvs(record_data) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("resolver: bad record TLV: {e}");
+                continue;
+            }
+        };
 
-        // Verify: sign(permanent_sk, eph_key) must match.
-        if verify(permanent_pubkey, &eph_key, sig).is_err() {
-            tracing::warn!("resolver: bad signature for peer eph={}", hex::encode(&eph_key[..4]));
+        let node_pub = match inner.get_bytes(TAG_NODE_PUB) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(b);
+                arr
+            }
+            _ => { continue; }
+        };
+
+        let sig = match inner.get_bytes(TAG_SIGNATURE) {
+            Ok(b) if b.len() == 64 => b,
+            _ => { continue; }
+        };
+
+        let priority = inner.get_u8(TAG_PRIORITY).unwrap_or(0);
+
+        let client_id = match inner.get_u32(TAG_CLIENT_ID) {
+            Ok(v) => v,
+            Err(_) => { continue; }
+        };
+
+        let expires_ms = match inner.get_u64(TAG_EXPIRES_MS) {
+            Ok(v) => v,
+            Err(_) => { continue; }
+        };
+
+        // Verify: sign(permanent_sk, node_pub) must match.
+        if verify(permanent_pubkey, &node_pub, sig).is_err() {
+            tracing::warn!("resolver: bad signature for peer eph={}", hex::encode(&node_pub[..4]));
             continue;
         }
 
         peers.push(CachedPeer {
-            addr: eph_key,
+            addr: node_pub,
             priority,
             client_id,
-            expires_at: now + Duration::from_secs(ttl_secs),
+            expires_at: now + Duration::from_millis(expires_ms),
         });
     }
 
@@ -382,20 +454,23 @@ mod tests {
         SigningKey::generate(&mut OsRng)
     }
 
-    /// Build a valid GET_ADDRS response payload for `count` peers, signed with
-    /// the given permanent signing key.
+    /// Build a valid V2 GET_ADDRS response TLV payload for the given peers.
     fn build_get_addrs_payload(
         permanent_sk: &SigningKey,
-        peers: &[([u8; 32], u8, u32, u64)],  // (eph_key, priority, client_id, ttl)
+        peers: &[([u8; 32], u8, u32, u64)],  // (eph_key, priority, client_id, expires_ms)
     ) -> Vec<u8> {
-        let mut payload = vec![peers.len() as u8];
-        for (eph_key, priority, client_id, ttl) in peers {
+        let mut payload = Vec::new();
+        write_tlv_u8(&mut payload, TAG_COUNT, peers.len() as u8);
+
+        for (eph_key, priority, client_id, expires_ms) in peers {
             let sig = sign(permanent_sk, eph_key.as_slice());
-            payload.extend_from_slice(eph_key);
-            payload.extend_from_slice(&sig);
-            payload.push(*priority);
-            payload.extend_from_slice(&client_id.to_be_bytes());
-            payload.extend_from_slice(&ttl.to_be_bytes());
+            let mut record = Vec::new();
+            write_tlv(&mut record, TAG_NODE_PUB, eph_key);
+            write_tlv(&mut record, TAG_SIGNATURE, &sig);
+            write_tlv_u8(&mut record, TAG_PRIORITY, *priority);
+            write_tlv_u32(&mut record, TAG_CLIENT_ID, *client_id);
+            write_tlv_u64(&mut record, TAG_EXPIRES_MS, *expires_ms);
+            write_tlv(&mut payload, TAG_RECORD, &record);
         }
         payload
     }
@@ -450,7 +525,7 @@ mod tests {
         assert!(parse_tracker(&hex).is_none());
     }
 
-    // ── parse_get_addrs_response ──────────────────────────────────────────────
+    // ── parse_get_addrs_response (V2 TLV) ───────────────────────────────────
 
     #[test]
     fn parse_get_addrs_empty_payload() {
@@ -461,8 +536,9 @@ mod tests {
 
     #[test]
     fn parse_get_addrs_zero_count() {
+        let mut payload = Vec::new();
+        write_tlv_u8(&mut payload, TAG_COUNT, 0);
         let permanent_pk = [0u8; 32];
-        let payload = vec![0u8]; // count = 0
         let peers = parse_get_addrs_response(&payload, &permanent_pk).unwrap();
         assert!(peers.is_empty());
     }
@@ -472,14 +548,14 @@ mod tests {
         let sk            = random_sk();
         let permanent_pk  = sk.verifying_key().to_bytes();
         let eph_key       = [7u8; 32];
-        let payload = build_get_addrs_payload(&sk, &[(eph_key, 5, 42, 300)]);
+        let payload = build_get_addrs_payload(&sk, &[(eph_key, 5, 42, 300_000)]);
 
         let peers = parse_get_addrs_response(&payload, &permanent_pk).unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].addr, eph_key);
         assert_eq!(peers[0].priority, 5);
         assert_eq!(peers[0].client_id, 42);
-        // TTL was 300 s; expires_at should be in the future
+        // expires_ms was 300_000 ms = 300 s; expires_at should be in the future
         assert!(peers[0].expires_at > Instant::now());
     }
 
@@ -488,8 +564,8 @@ mod tests {
         let sk           = random_sk();
         let permanent_pk = sk.verifying_key().to_bytes();
         let peers_in = [
-            ([1u8; 32], 10u8, 1u32, 600u64),
-            ([2u8; 32], 5,    2,    300),
+            ([1u8; 32], 10u8, 1u32, 600_000u64),
+            ([2u8; 32], 5,    2,    300_000),
         ];
         let payload = build_get_addrs_payload(&sk, &peers_in);
 
@@ -505,17 +581,31 @@ mod tests {
         let eph_key       = [0xABu8; 32];
 
         // Signed by the wrong key — should fail verification and be skipped.
-        let payload = build_get_addrs_payload(&attacker_sk, &[(eph_key, 1, 1, 60)]);
+        let payload = build_get_addrs_payload(&attacker_sk, &[(eph_key, 1, 1, 60_000)]);
 
         let peers = parse_get_addrs_response(&payload, &permanent_pk).unwrap();
         assert!(peers.is_empty(), "bad-sig record must be dropped");
     }
 
     #[test]
-    fn parse_get_addrs_short_payload_is_error() {
-        // Declares 1 peer but provides 0 record bytes.
-        let payload = [1u8]; // count=1, no record data
-        let permanent_pk = [0u8; 32];
+    fn parse_get_addrs_count_mismatch_is_error() {
+        // Declares 2 peers via TAG_COUNT but only provides 1 TAG_RECORD.
+        let sk = random_sk();
+        let eph_key = [7u8; 32];
+        let sig = sign(&sk, &eph_key);
+
+        let mut payload = Vec::new();
+        write_tlv_u8(&mut payload, TAG_COUNT, 2);
+        // Only one record
+        let mut record = Vec::new();
+        write_tlv(&mut record, TAG_NODE_PUB, &eph_key);
+        write_tlv(&mut record, TAG_SIGNATURE, &sig);
+        write_tlv_u8(&mut record, TAG_PRIORITY, 1);
+        write_tlv_u32(&mut record, TAG_CLIENT_ID, 1);
+        write_tlv_u64(&mut record, TAG_EXPIRES_MS, 60_000);
+        write_tlv(&mut payload, TAG_RECORD, &record);
+
+        let permanent_pk = sk.verifying_key().to_bytes();
         assert!(parse_get_addrs_response(&payload, &permanent_pk).is_err());
     }
 

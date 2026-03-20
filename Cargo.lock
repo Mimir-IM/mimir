@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "mimir"
-version = "0.1.1"
+version = "0.2.2"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -3128,8 +3128,8 @@ dependencies = [
 
 [[package]]
 name = "ygg_stream"
-version = "0.1.2"
-source = "git+https://github.com/Revertron/ygg_stream?tag=v0.1.2#c6fd8de580c2d47ed4804481b0ad2679f7e1117f"
+version = "0.1.9"
+source = "git+https://github.com/Revertron/ygg_stream?tag=v0.1.9#e9e478cb14dadbb66b9701f50c3890625a62861c"
 dependencies = [
  "bytes",
  "ed25519-dalek",
