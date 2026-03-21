@@ -70,6 +70,15 @@ impl MediatorNode {
         Ok(())
     }
 
+    /// Probe all live mediator connections by sending a ping.
+    ///
+    /// Call this when Yggdrasil connectivity is restored (e.g. from
+    /// `onConnectivityChanged(true)`) to quickly detect sessions that died
+    /// during the outage.  Dead sessions trigger the normal reconnect flow.
+    pub fn check_connections(&self) {
+        self.manager.check_connections();
+    }
+
     /// Stop all mediator connections.
     pub fn stop(&self) {
         self.manager.stop_all();

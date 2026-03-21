@@ -159,6 +159,15 @@ impl MediatorClient {
 
     // ── Public command methods ─────────────────────────────────────────────────
 
+    /// Send a single ping to verify the connection is alive.
+    pub async fn ping(&self) -> Result<(), MimirError> {
+        let resp = self.request(CMD_PING, &[]).await?;
+        if resp.status != STATUS_OK {
+            return Err(resp.into_error("ping"));
+        }
+        Ok(())
+    }
+
     /// `CMD_CREATE_CHAT` — includes proof-of-work (may take a few seconds).
     pub async fn create_chat(&self, sk: &SigningKey, name: &str, description: &str, avatar: Option<&[u8]>) -> Result<i64, MimirError> {
         let our_pubkey = crate::crypto::pubkey_of(sk);
@@ -445,8 +454,12 @@ impl MediatorClient {
         let header = build_request_header(cmd, req_id, payload.len());
         let write_err: Option<MimirError> = async {
             let _guard = self.write_mu.lock().await;
-            if let Err(e) = self.conn.write(&header).await {
-                return Some(MimirError::Io(e));
+            match time::timeout(CHUNK_TIMEOUT, self.conn.write(&header)).await {
+                Ok(Ok(_))  => {}
+                Ok(Err(e)) => return Some(MimirError::Io(e)),
+                Err(_)     => return Some(MimirError::Connection(
+                    format!("request cmd=0x{cmd:02x}: header write timed out")
+                )),
             }
             let mut offset = 0;
             while offset < payload.len() {
@@ -515,6 +528,9 @@ impl MediatorClient {
                         tracing::warn!("mediator {hex8}: reader firing on_disconnected");
                         listener.on_disconnected(self.mediator_pubkey.to_vec());
                     }
+                    // Signal the ping loop to stop promptly instead of letting it
+                    // run another full cycle on the dead connection.
+                    let _ = self.stop_tx.send(());
                     return;
                 }
             };

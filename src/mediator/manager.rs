@@ -127,6 +127,9 @@ impl MediatorManager {
             let mut map = self.clients.lock().unwrap();
             if client.is_disconnected() {
                 // Reader/ping detected disconnect before we finished setup — retry.
+                // Stop the client to clean up spawned reader/ping tasks so they
+                // don't leak and fire spurious on_disconnected later.
+                client.stop();
                 tracing::error!("mediator {hex8}: connection dropped during setup (before insert)");
                 return Err(MimirError::Connection("connection dropped immediately after auth".into()));
             }
@@ -219,6 +222,32 @@ impl MediatorManager {
         self.listener.on_subscribed(mediator_pubkey.to_vec(), chat_id, last_message_id);
     }
 
+    /// Probe all live mediator connections by sending a ping.
+    ///
+    /// Call this when Yggdrasil connectivity is restored after a drop.
+    /// Dead sessions are detected quickly (header write timeout + response
+    /// timeout) and the normal disconnect → reconnect flow kicks in.
+    pub fn check_connections(&self) {
+        let clients: Vec<MediatorClient> = {
+            self.clients.lock().unwrap().values().cloned().collect()
+        };
+        for client in clients {
+            if client.is_disconnected() {
+                continue;
+            }
+            tokio::spawn(async move {
+                let hex8 = &hex::encode(client.mediator_pubkey)[..8];
+                tracing::info!("mediator {hex8}: probing after connectivity change");
+                if let Err(e) = client.ping().await {
+                    tracing::warn!("mediator {hex8}: probe failed: {e}");
+                    // The failed request already aborted the conn and sent
+                    // stop_tx, so the reader will fire on_disconnected →
+                    // reconnect is scheduled automatically.
+                }
+            });
+        }
+    }
+
     /// Retrieve a live client (returns None if not connected).
     pub fn get(&self, mediator_pubkey: &[u8; 32]) -> Option<MediatorClient> {
         let hex = hex::encode(mediator_pubkey);
@@ -301,15 +330,16 @@ impl MediatorEventListener for ReconnectListener {
 
     fn on_disconnected(&self, mediator_pubkey: Vec<u8>) {
         let hex = hex::encode(&mediator_pubkey);
-        // Only schedule a reconnect if we actually removed the dead client.
-        // If remove_client returns false, a newer live client is already in the
-        // map (stale reader firing late) — do not disrupt it.
+        // Only schedule a reconnect and notify the app if we actually removed
+        // the dead client.  If remove_client returns false, a newer live client
+        // is already in the map (stale reader firing late) — do not disrupt it
+        // and do NOT forward the stale disconnect to the app (causes UI flicker).
         if self.manager.remove_client(&hex) {
             tracing::warn!("mediator {}: disconnected, scheduling reconnect", &hex[..8.min(hex.len())]);
             self.manager.schedule_reconnect(self.pubkey);
+            self.inner.on_disconnected(mediator_pubkey);
         } else {
             tracing::debug!("mediator {}: stale disconnect notification ignored", &hex[..8.min(hex.len())]);
         }
-        self.inner.on_disconnected(mediator_pubkey);
     }
 }

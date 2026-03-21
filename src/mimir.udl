@@ -454,6 +454,9 @@ interface MediatorNode {
     [Throws=MimirError]
     void connect_to_mediator(bytes mediator_pubkey);
 
+    /// Probe all live mediator connections after Yggdrasil connectivity restores.
+    void check_connections();
+
     /// Stop all mediator connections.
     void stop();
 
