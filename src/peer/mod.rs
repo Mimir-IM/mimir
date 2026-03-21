@@ -386,12 +386,14 @@ impl PeerNode {
                                 }
                                 Err(e) => {
                                     tracing::error!("Accept error: {}", e);
-                                    break;
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    // continue accepting — a single error must not kill the listener
                                 }
                             }
                         }
                     }
                 }
+                tracing::error!("CRITICAL: accept loop exited");
             });
         }
 
@@ -435,6 +437,7 @@ impl PeerNode {
                         }
                     }
                 }
+                tracing::error!("CRITICAL: peer-event monitor exited");
             });
         }
 
@@ -443,7 +446,10 @@ impl PeerNode {
             let sel     = Arc::clone(&selector);
             let node    = Arc::clone(&state.node);
             let stop_rx = stop_tx.subscribe();
-            rt.spawn(run_selector(sel, node, stop_rx));
+            rt.spawn(async move {
+                run_selector(sel, node, stop_rx).await;
+                tracing::error!("CRITICAL: ygg_selector task exited");
+            });
         }
 
         Ok(PeerNode {
@@ -492,7 +498,7 @@ impl PeerNode {
             // Mark current value as seen, then wait for a change or timeout.
             rx.borrow_and_update();
             let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
+                Duration::from_millis(timeout_ms),
                 rx.changed(),
             )
             .await;
