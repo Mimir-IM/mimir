@@ -318,6 +318,7 @@ interface PeerNode {
     [Throws=MimirError]
     constructor(
         bytes                signing_key,
+        bytes?               ephemeral_key,
         sequence<string>     ygg_peers,
         u16                  peer_port,
         sequence<string>     trackers,
@@ -327,6 +328,11 @@ interface PeerNode {
 
     /// Our 32-byte Ed25519 public key (= Yggdrasil identity).
     bytes public_key();
+
+    /// The 32-byte ephemeral seed used for the Yggdrasil node.
+    /// Persist this and pass it back via `ephemeral_key` constructor param
+    /// to keep the same routing address across restarts.
+    bytes ephemeral_key();
 
     /// Replace the list of managed Yggdrasil router peers (priority = slice order).
     /// Metrics are preserved for URIs that remain in the new list.

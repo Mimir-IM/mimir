@@ -31,7 +31,7 @@ pub struct MediatorManager {
     attempts: Mutex<HashMap<String, u32>>,
     /// stop signal cancels all reconnect tasks
     stop_tx: broadcast::Sender<()>,
-    /// Per-key async mutex — serialises concurrent connect attempts for the same mediator.
+    /// Per-key async mutex — serializes concurrent connect attempts for the same mediator.
     connecting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Chats the app explicitly subscribed to, merged with server list on reconnect.
     subscriptions: Mutex<HashMap<String, HashSet<i64>>>,
@@ -201,12 +201,32 @@ impl MediatorManager {
         tracing::info!("mediator {}: reconnecting in {delay:?} (attempt {attempt})", &hex[..8]);
 
         let mgr = Arc::clone(self);
+        let node = Arc::clone(&self.node);
         let mut stop_rx = self.stop_tx.subscribe();
         tokio::spawn(async move {
             tokio::select! {
                 biased;
                 _ = stop_rx.recv() => { return; }
                 _ = tokio::time::sleep(delay) => {}
+            }
+
+            // Don't attempt to connect if there are no Yggdrasil peers —
+            // the overlay network is unreachable.  Wait for a peer event
+            // (or stop signal) instead of busy-looping on schedule_reconnect.
+            if node.count_active_peers().await == 0 {
+                tracing::debug!("mediator {}: no active peers, waiting for connectivity", &hex[..8]);
+                let mut peer_rx = node.subscribe_peer_events();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop_rx.recv() => { return; }
+                        _ = peer_rx.recv() => {}
+                    }
+                    if node.count_active_peers().await > 0 {
+                        tracing::debug!("mediator {}: peers available, proceeding with reconnect", &hex[..8]);
+                        break;
+                    }
+                }
             }
 
             // Use get_or_create so the per-key lock prevents parallel reconnects.
@@ -252,6 +272,11 @@ impl MediatorManager {
     pub fn get(&self, mediator_pubkey: &[u8; 32]) -> Option<MediatorClient> {
         let hex = hex::encode(mediator_pubkey);
         self.clients.lock().unwrap().get(&hex).cloned()
+    }
+
+    /// Returns `true` if the underlying Yggdrasil node has at least one active peer.
+    pub async fn has_active_peers(&self) -> bool {
+        self.node.count_active_peers().await > 0
     }
 
     /// Stop all connections and cancel all reconnect tasks.

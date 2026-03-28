@@ -425,11 +425,20 @@ async fn message_loop(
             }
         }
 
-        // Time until next ping
-        let next_ping_at = last_ping_sent
-            .map(|t| t + ping_deadline)
-            .unwrap_or_else(|| now + ping_deadline);
-        let until_ping = next_ping_at.saturating_duration_since(now);
+        // Time until the next loop iteration must run.
+        // If there is an unanswered ping, wake up after PING_TIMEOUT so the
+        // check at the top of the loop can declare the peer dead.
+        // Otherwise, schedule the next outgoing ping after ping_deadline.
+        let ping_pending = last_ping_sent
+            .map_or(false, |sent| last_pong < sent);
+        let next_wake = if ping_pending {
+            last_ping_sent.unwrap() + PING_TIMEOUT
+        } else {
+            last_ping_sent
+                .map(|t| t + ping_deadline)
+                .unwrap_or_else(|| now + ping_deadline)
+        };
+        let until_ping = next_wake.saturating_duration_since(now);
 
         tokio::select! {
             // Incoming frame from the reader task
@@ -479,9 +488,17 @@ async fn message_loop(
 
             // Ping timer
             _ = tokio::time::sleep(until_ping) => {
-                let frame = build_ping_frame();
-                if write_tx.send(frame).is_err() { break 'main; }
-                last_ping_sent = Some(Instant::now());
+                // Only send a new ping (and update the timestamp) if the
+                // previous ping was already answered.  Otherwise, keep the
+                // original send time so that the PING_TIMEOUT check at the
+                // top of the loop can fire correctly.
+                let ping_answered = last_ping_sent
+                    .map_or(true, |sent| last_pong >= sent);
+                if ping_answered {
+                    let frame = build_ping_frame();
+                    if write_tx.send(frame).is_err() { break 'main; }
+                    last_ping_sent = Some(Instant::now());
+                }
             }
         }
     }

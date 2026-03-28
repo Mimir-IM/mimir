@@ -26,6 +26,7 @@
 //!               TAG_NODE_PUB, TAG_SIGNATURE, TAG_PRIORITY, TAG_CLIENT_ID, TAG_EXPIRES_MS)
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ use crate::tlv::*;
 const VERSION: u8 = 2;
 const CMD_ANNOUNCE: u8 = 0x00;
 const CMD_GET_ADDRS: u8 = 0x01;
+const CMD_PING: u8 = 0x02;
 
 /// How long to wait for a single tracker response.
 const RECV_TIMEOUT_MS: i64 = 5_000;
@@ -65,7 +67,7 @@ const TAG_RECORD:     u8 = 0x0C;
 struct TrackerEntry {
     pubkey: [u8; 32],
     port: u16,
-    latency_ms: u64,   // updated by ping; used to pick the fastest tracker
+    latency_ms: AtomicU64,
 }
 
 // ── Cache entry ───────────────────────────────────────────────────────────────
@@ -138,10 +140,11 @@ impl Resolver {
         }
     }
 
-    /// Query all configured trackers for `permanent_pubkey`.
+    /// Query a responsive tracker for `permanent_pubkey`.
     ///
-    /// Trackers are tried in ascending latency order; returns as soon as the
-    /// first tracker returns at least one result.  The cache is updated.
+    /// Pings trackers to find a live one (priming the Yggdrasil route),
+    /// then queries that single tracker.  Trackers sync with each other,
+    /// so one responsive tracker is sufficient.
     pub async fn query_trackers(&self, permanent_pubkey: &[u8; 32]) -> Vec<[u8; 32]> {
         if self.trackers.is_empty() {
             return vec![];
@@ -151,49 +154,53 @@ impl Resolver {
         // concurrent queries or announces.
         let _lock = self.recv_lock.lock().await;
 
-        // Try trackers in latency order (initially all equal at 9999 ms).
-        let mut indices: Vec<usize> = (0..self.trackers.len()).collect();
-        indices.sort_by_key(|&i| self.trackers[i].latency_ms);
+        let idx = match self.pick_tracker().await {
+            Some(i) => i,
+            None => {
+                tracing::warn!("resolver: no tracker responded to ping");
+                return vec![];
+            }
+        };
 
-        for idx in indices {
-            let tracker = &self.trackers[idx];
-            match self.get_addrs_from(tracker, permanent_pubkey).await {
-                Ok(peers) if !peers.is_empty() => {
-                    let keys: Vec<[u8; 32]> = {
-                        let mut sorted = peers.iter().collect::<Vec<_>>();
-                        sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
-                        sorted.iter().map(|p| p.addr).collect()
-                    };
+        let tracker = &self.trackers[idx];
+        match self.get_addrs_from(tracker, permanent_pubkey).await {
+            Ok(peers) => {
+                let keys: Vec<[u8; 32]> = {
+                    let mut sorted = peers.iter().collect::<Vec<_>>();
+                    sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+                    sorted.iter().map(|p| p.addr).collect()
+                };
+                if !peers.is_empty() {
                     self.cache.lock().unwrap().insert(*permanent_pubkey, peers);
-                    return keys;
                 }
-                Ok(_) => {
-                    tracing::debug!(
-                        "resolver: tracker {} returned 0 peers for {}",
-                        hex::encode(&tracker.pubkey[..4]),
-                        hex::encode(&permanent_pubkey[..4])
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "resolver: tracker {} failed: {e}",
-                        hex::encode(&tracker.pubkey[..4])
-                    );
-                }
+                keys
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "resolver: tracker {} query failed: {e}",
+                    hex::encode(&tracker.pubkey[..4])
+                );
+                vec![]
             }
         }
-        vec![]
     }
 
-    /// Announce our current ephemeral address (= `our_pubkey`) to all trackers.
+    /// Announce our current ephemeral address (= `our_pubkey`) to a tracker.
     ///
-    /// Fires-and-forgets from the caller's perspective — errors are only logged.
+    /// Pings trackers to find a live one (priming the route), then announces
+    /// to that single tracker.  Trackers sync with each other, so one is enough.
     pub async fn announce(&self) -> Result<i64, String> {
         if self.trackers.is_empty() {
             return Err(String::from("No useful trackers"));
         }
 
         let _lock = self.recv_lock.lock().await;
+
+        let idx = match self.pick_tracker().await {
+            Some(i) => i,
+            None => return Err("no tracker responded to ping".to_string()),
+        };
+        let tracker = &self.trackers[idx];
 
         // Sign our ephemeral key with our permanent signing key.
         let our_addr = self.our_addr;
@@ -218,40 +225,60 @@ impl Resolver {
         frame.push(CMD_ANNOUNCE);
         frame.extend_from_slice(&tlv_payload);
 
-        for tracker in &self.trackers {
-            // Pre-register listener on tracker.port before sending so we don't miss
-            // the response (tracker responds on the same port it listens on).
-            let _ = self.node.recv_datagram_with_timeout(tracker.port, 1).await;
+        // Pre-register listener so we don't miss the response.
+        let _ = self.node.recv_datagram_with_timeout(tracker.port, 1).await;
 
-            if let Err(e) = self.node.send_datagram(&tracker.pubkey, tracker.port, &frame).await {
-                tracing::warn!("resolver: announce send to {} failed: {e}", hex::encode(&tracker.pubkey[..4]));
-                continue;
-            }
-            // Best-effort read of TTL response.
-            match self.recv_matching(&tracker.pubkey, &nonce, CMD_ANNOUNCE, tracker.port).await {
-                Ok(payload) => {
-                    match parse_tlvs(&payload) {
-                        Ok(tlvs) => {
-                            if let Ok(ttl) = tlvs.get_u64(TAG_TTL_SECS) {
-                                let ttl = ttl as i64;
-                                tracing::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
-                                return Ok(ttl);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("resolver: announce response parse error from {}: {e}", hex::encode(&tracker.pubkey[..4]));
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("resolver: no announce ack from {}: {e}", hex::encode(&tracker.pubkey[..4]));
-                }
-            }
+        if let Err(e) = self.node.send_datagram(&tracker.pubkey, tracker.port, &frame).await {
+            return Err(format!("announce send to {} failed: {e}", hex::encode(&tracker.pubkey[..4])));
         }
-        Err("announce failed".to_string())
+
+        match self.recv_matching(&tracker.pubkey, &nonce, CMD_ANNOUNCE, tracker.port).await {
+            Ok(payload) => {
+                let tlvs = parse_tlvs(&payload)
+                    .map_err(|e| format!("announce response parse error: {e}"))?;
+                let ttl = tlvs.get_u64(TAG_TTL_SECS)
+                    .map_err(|e| format!("announce response missing TTL: {e}"))? as i64;
+                tracing::info!("resolver: announced to {}, TTL={ttl}s", hex::encode(&tracker.pubkey[..4]));
+                Ok(ttl)
+            }
+            Err(e) => Err(format!("no announce ack from {}: {e}", hex::encode(&tracker.pubkey[..4]))),
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Ping each tracker in order until one responds.  Returns the index of
+    /// the first responsive tracker, or `None` if all are unreachable.
+    ///
+    /// The ping primes the Yggdrasil route and confirms the tracker is alive,
+    /// so the caller can send the real request to that tracker only.
+    async fn pick_tracker(&self) -> Option<usize> {
+        // Try trackers in ascending latency order (fastest-known first).
+        let mut indices: Vec<usize> = (0..self.trackers.len()).collect();
+        indices.sort_by_key(|&i| self.trackers[i].latency_ms.load(Ordering::Relaxed));
+
+        for i in indices {
+            let tracker = &self.trackers[i];
+            let nonce = random_nonce();
+            let frame = [VERSION, nonce[0], nonce[1], nonce[2], nonce[3], CMD_PING];
+
+            let _ = self.node.recv_datagram_with_timeout(tracker.port, 1).await;
+            if self.node.send_datagram(&tracker.pubkey, tracker.port, &frame).await.is_err() {
+                continue;
+            }
+            let t0 = Instant::now();
+            if self.recv_matching(&tracker.pubkey, &nonce, CMD_PING, tracker.port).await.is_ok() {
+                let rtt = t0.elapsed().as_millis() as u64;
+                tracker.latency_ms.store(rtt, Ordering::Relaxed);
+                tracing::debug!("resolver: tracker {} ping RTT = {rtt}ms", hex::encode(&tracker.pubkey[..4]));
+                return Some(i);
+            }
+            let prev = tracker.latency_ms.load(Ordering::Relaxed);
+            tracker.latency_ms.store(prev.saturating_add(25), Ordering::Relaxed);
+            tracing::debug!("resolver: ping to tracker {} timed out (latency now {}ms)", hex::encode(&tracker.pubkey[..4]), prev + 25);
+        }
+        None
+    }
 
     async fn get_addrs_from(&self, tracker: &TrackerEntry, permanent_pubkey: &[u8; 32]) -> Result<Vec<CachedPeer>, String> {
         let nonce = random_nonce();
@@ -428,7 +455,7 @@ fn parse_tracker(s: &str) -> Option<TrackerEntry> {
     let port: u16 = port_str.parse().ok()?;
     let bytes = hex::decode(hex_part).ok()?;
     let pubkey: [u8; 32] = bytes.try_into().ok()?;
-    Some(TrackerEntry { pubkey, port, latency_ms: 9_999 })
+    Some(TrackerEntry { pubkey, port, latency_ms: AtomicU64::new(50) })
 }
 
 fn random_nonce() -> [u8; 4] {

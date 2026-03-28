@@ -63,8 +63,19 @@ impl MediatorNode {
         let key = to_key32(&mediator_pubkey)?;
         let mgr = Arc::clone(&self.manager);
         self.rt.spawn(async move {
-            if let Err(e) = mgr.get_or_create(&key).await {
-                tracing::error!("connect_to_mediator {}: {e}", hex::encode(key));
+            let should_reconnect = if mgr.has_active_peers().await {
+                if let Err(e) = mgr.get_or_create(&key).await {
+                    tracing::error!("connect_to_mediator {}: {e}", hex::encode(key));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                tracing::debug!("connect_to_mediator {}: no active peers, will retry", hex::encode(&key[..4]));
+                true
+            };
+            if should_reconnect {
+                mgr.schedule_reconnect(key);
             }
         });
         Ok(())

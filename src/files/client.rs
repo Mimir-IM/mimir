@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time;
 use ygg_stream::{AsyncConn, AsyncNode};
 
@@ -20,11 +20,32 @@ use crate::mediator::protocol::*;
 
 const REQ_TIMEOUT: Duration = Duration::from_secs(15);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-const PING_INTERVAL: Duration = Duration::from_secs(50);
+/// Close the connection after this much idle time (no requests sent/received).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Pending request map ───────────────────────────────────────────────────────
 
 type PendingMap = Mutex<HashMap<u16, oneshot::Sender<Response>>>;
+type StreamingMap = Mutex<HashMap<u16, mpsc::Sender<Response>>>;
+
+/// Handle for a streaming download in progress.
+/// Automatically removes itself from the streaming map when dropped.
+pub struct StreamingDownload {
+    rx: mpsc::Receiver<Response>,
+    req_id: u16,
+    streaming: Arc<StreamingMap>,
+}
+
+impl Drop for StreamingDownload {
+    fn drop(&mut self) {
+        let streaming = Arc::clone(&self.streaming);
+        let req_id = self.req_id;
+        // Spawn cleanup since we can't await in Drop
+        tokio::spawn(async move {
+            streaming.lock().await.remove(&req_id);
+        });
+    }
+}
 
 // ── FilesClient ───────────────────────────────────────────────────────────────
 
@@ -33,6 +54,7 @@ type PendingMap = Mutex<HashMap<u16, oneshot::Sender<Response>>>;
 pub struct FilesClient {
     conn:             Arc<AsyncConn>,
     pending:          Arc<PendingMap>,
+    streaming:        Arc<StreamingMap>,
     write_mu:         Arc<Mutex<()>>,
     next_id:          Arc<AtomicU64>,
     last_activity_ms: Arc<AtomicU64>,
@@ -42,12 +64,7 @@ pub struct FilesClient {
 
 impl FilesClient {
     /// Dial `server_pubkey` on `port`, authenticate, and spawn background tasks.
-    pub async fn connect(
-        node: &AsyncNode,
-        server_pubkey: [u8; 32],
-        port: u16,
-        sk: &SigningKey,
-    ) -> Result<Self, MimirError> {
+    pub async fn connect(node: &AsyncNode, server_pubkey: [u8; 32], port: u16, sk: &SigningKey) -> Result<Self, MimirError> {
         let conn = node.connect(&server_pubkey, port).await
             .map_err(|e| MimirError::Connection(e.to_string()))?;
         let conn = Arc::new(conn);
@@ -57,8 +74,9 @@ impl FilesClient {
             .map_err(|e| MimirError::Io(e))?;
 
         let (stop_tx, _) = broadcast::channel::<()>(1);
-        let pending:  Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
-        let write_mu: Arc<Mutex<()>>  = Arc::new(Mutex::new(()));
+        let pending:  Arc<PendingMap>   = Arc::new(Mutex::new(HashMap::new()));
+        let streaming: Arc<StreamingMap> = Arc::new(Mutex::new(HashMap::new()));
+        let write_mu: Arc<Mutex<()>>    = Arc::new(Mutex::new(()));
         let next_id      = Arc::new(AtomicU64::new(1));
         let last_ms      = Arc::new(AtomicU64::new(now_ms()));
         let disconnected = Arc::new(AtomicBool::new(false));
@@ -66,6 +84,7 @@ impl FilesClient {
         let client = FilesClient {
             conn:             Arc::clone(&conn),
             pending:          Arc::clone(&pending),
+            streaming:        Arc::clone(&streaming),
             write_mu:         Arc::clone(&write_mu),
             next_id:          Arc::clone(&next_id),
             last_activity_ms: Arc::clone(&last_ms),
@@ -91,6 +110,7 @@ impl FilesClient {
                         payload: b"connection closed".to_vec(),
                     });
                 });
+                c.streaming.lock().await.clear();
             });
         }
 
@@ -100,7 +120,7 @@ impl FilesClient {
             return Err(e);
         }
 
-        // Spawn ping task.
+        // Spawn idle-timeout task: close connection after IDLE_TIMEOUT of inactivity.
         {
             let c = client.clone();
             let mut stop_rx = stop_tx.subscribe();
@@ -108,7 +128,7 @@ impl FilesClient {
                 tokio::select! {
                     biased;
                     _ = stop_rx.recv() => {},
-                    _ = c.ping_loop() => {},
+                    _ = c.idle_timeout_loop() => {},
                 }
             });
         }
@@ -186,6 +206,73 @@ impl FilesClient {
         let total = tlvs.get_u64(TAG_TOTAL_SIZE)?;
         let data = tlvs.opt_bytes(TAG_CHUNK_DATA).unwrap_or_default();
         Ok((data, resp_offset, total))
+    }
+
+    /// Start a streaming download: send one CMD_DOWNLOAD request and return
+    /// a receiver that delivers response frames as they arrive from the server.
+    /// Call `download_streaming_next()` in a loop to read chunks.
+    pub async fn download_streaming_start(
+        &self,
+        hash: &[u8; 32],
+        guid: i64,
+        start_offset: u64,
+    ) -> Result<StreamingDownload, MimirError> {
+        let raw = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req_id = ((raw % 0xFFFF) as u16) + 1;
+
+        // Register in streaming map so the reader delivers all frames.
+        let (tx, rx) = mpsc::channel::<Response>(16);
+        self.streaming.lock().await.insert(req_id, tx);
+
+        // Build and send the request (limit = u32::MAX → server streams entire file).
+        let mut p = Vec::new();
+        write_tlv(&mut p, TAG_FILE_HASH, hash);
+        write_tlv_i64(&mut p, TAG_MESSAGE_GUID, guid);
+        write_tlv_u64(&mut p, TAG_OFFSET, start_offset);
+        write_tlv_u32(&mut p, TAG_LIMIT, u32::MAX);
+
+        let header = build_request_header(CMD_FILE_DOWNLOAD, req_id, p.len());
+        let send_result = async {
+            let _guard = self.write_mu.lock().await;
+            self.conn.write(&header).await?;
+            self.conn.write(&p).await?;
+            Ok::<(), String>(())
+        }.await;
+
+        if let Err(e) = send_result {
+            self.streaming.lock().await.remove(&req_id);
+            return Err(MimirError::Io(e));
+        }
+
+        Ok(StreamingDownload { rx, req_id, streaming: Arc::clone(&self.streaming) })
+    }
+
+    /// Read the next chunk from a streaming download.
+    /// Returns `(offset, chunk_data, total_size)`.
+    /// When `offset + chunk_data.len() >= total_size`, the download is complete.
+    pub async fn download_streaming_next(
+        &self,
+        dl: &mut StreamingDownload,
+    ) -> Result<(u64, Vec<u8>, u64), MimirError> {
+        let resp = match time::timeout(UPLOAD_TIMEOUT, dl.rx.recv()).await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return Err(MimirError::Connection("files: stream closed during download".into())),
+            Err(_) => {
+                self.conn.abort().await;
+                return Err(MimirError::Connection("files: streaming download timed out".into()));
+            }
+        };
+
+        if resp.status != STATUS_OK {
+            return Err(resp.into_error("downloadStream"));
+        }
+
+        let tlvs = parse_tlvs(&resp.payload)?;
+        let chunk_data = tlvs.opt_bytes(TAG_CHUNK_DATA).unwrap_or_default();
+        let chunk_offset = tlvs.get_u64(TAG_OFFSET)?;
+        let total_size = tlvs.get_u64(TAG_TOTAL_SIZE)?;
+
+        Ok((chunk_offset, chunk_data, total_size))
     }
 
     // ── Internal: auth ────────────────────────────────────────────────────────
@@ -301,7 +388,20 @@ impl FilesClient {
                 }
             };
 
-            // No push messages — dispatch all responses to pending map.
+            // Dispatch: check streaming map first (multi-frame), then pending (oneshot).
+            // Clone the sender and drop the lock BEFORE the async send to avoid
+            // holding the mutex across an await point (which would block all
+            // other response dispatching if the channel is full).
+            {
+                let maybe_tx = {
+                    let smap = self.streaming.lock().await;
+                    smap.get(&resp.req_id).cloned()
+                };
+                if let Some(tx) = maybe_tx {
+                    let _ = tx.send(resp).await;
+                    continue;
+                }
+            }
             let mut map = self.pending.lock().await;
             if let Some(tx) = map.remove(&resp.req_id) {
                 let _ = tx.send(resp);
@@ -314,23 +414,23 @@ impl FilesClient {
         }
     }
 
-    // ── Internal: ping loop ───────────────────────────────────────────────────
+    // ── Internal: idle timeout ───────────────────────────────────────────────
 
-    async fn ping_loop(&self) {
-        let mut interval = time::interval(PING_INTERVAL);
+    /// Closes the connection after [`IDLE_TIMEOUT`] of no activity.
+    async fn idle_timeout_loop(&self) {
+        let check = Duration::from_secs(5);
+        let mut interval = time::interval(check);
         interval.tick().await; // skip immediate first tick
         loop {
             interval.tick().await;
             let elapsed = now_ms().saturating_sub(
                 self.last_activity_ms.load(Ordering::Relaxed)
             );
-            if elapsed >= PING_INTERVAL.as_millis() as u64 {
-                if let Err(e) = self.request(CMD_PING, &[]).await {
-                    tracing::error!("files ping failed: {e}");
-                    self.disconnected.store(true, Ordering::SeqCst);
-                    let _ = self.stop_tx.send(());
-                    return;
-                }
+            if elapsed >= IDLE_TIMEOUT.as_millis() as u64 {
+                tracing::debug!("files: closing idle connection");
+                self.disconnected.store(true, Ordering::SeqCst);
+                let _ = self.stop_tx.send(());
+                return;
             }
         }
     }

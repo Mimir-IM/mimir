@@ -22,7 +22,7 @@ use crate::{FilesEventListener, MimirError};
 use client::FilesClient;
 
 /// 1 MB upload/download chunk size.
-const CHUNK_SIZE: usize = 1024 * 1024;
+const CHUNK_SIZE: usize = 65536;
 
 // ── FilesNode ─────────────────────────────────────────────────────────────────
 
@@ -215,25 +215,24 @@ impl FilesNode {
     ) -> Result<(), MimirError> {
         let client = self.get_or_connect(server_pubkey).await?;
 
-        // Get total size
-        let (total_size, _guid) = client.file_info(hash).await?;
-
-        // Download to temp file
+        // Download to temp file using streaming (one request, server sends all chunks)
         let mut f = File::create(temp_path).await
             .map_err(|e| MimirError::Io(format!("create temp file: {e}")))?;
-        let mut offset: u64 = 0;
 
-        while offset < total_size {
-            let (chunk, _resp_offset, _total) = client.download_chunk(
-                hash, message_guid, offset, CHUNK_SIZE as u64,
-            ).await?;
-            if chunk.is_empty() {
+        let rx = client.download_streaming_start(hash, message_guid, 0).await?;
+        let mut rx = rx;
+        loop {
+            let (chunk_offset, chunk_data, total_size) = client.download_streaming_next(&mut rx).await?;
+            if chunk_data.is_empty() {
                 break;
             }
-            f.write_all(&chunk).await
+            f.write_all(&chunk_data).await
                 .map_err(|e| MimirError::Io(format!("write temp file: {e}")))?;
-            offset += chunk.len() as u64;
-            self.listener.on_download_progress(hash.to_vec(), message_guid, offset, total_size);
+            let progress = chunk_offset + chunk_data.len() as u64;
+            self.listener.on_download_progress(hash.to_vec(), message_guid, progress, total_size);
+            if progress >= total_size {
+                break;
+            }
         }
 
         f.flush().await.map_err(|e| MimirError::Io(format!("flush: {e}")))?;

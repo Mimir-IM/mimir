@@ -15,6 +15,7 @@ use ed25519_dalek::SigningKey;
 use rand::seq::SliceRandom;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
+use tracing::info;
 use ygg_stream::AsyncNode;
 
 
@@ -35,7 +36,7 @@ fn init_tracing() {
         use tracing_subscriber::EnvFilter;
 
         let env_filter = EnvFilter::new(
-            "ironwood=info,yggdrasil=info,ygg_stream=info,debug"
+            "ironwood=info,yggdrasil=info,ygg_stream=info,info"
         );
 
         #[cfg(target_os = "android")]
@@ -138,6 +139,7 @@ impl PeerEventListener for EventWrapper {
 
 struct PeerState {
     our_pubkey: [u8; 32],
+    ephemeral_seed: [u8; 32],
     signing_key: Arc<SigningKey>,
     node: Arc<AsyncNode>,
     peer_port: u16,
@@ -236,6 +238,7 @@ impl PeerNode {
     /// * `info_provider`  – Supplies and stores contact profile info.
     pub fn new(
         signing_key: Vec<u8>,
+        ephemeral_key: Option<Vec<u8>>,
         ygg_peers: Vec<String>,
         peer_port: u16,
         trackers: Vec<String>,
@@ -243,6 +246,8 @@ impl PeerNode {
         info_provider: Box<dyn InfoProvider>
     ) -> Result<Self, MimirError> {
         init_tracing();
+
+        info!("Starting Mimir node v{}", env!("CARGO_PKG_VERSION"));
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -268,9 +273,14 @@ impl PeerNode {
         let sk = SigningKey::from_bytes(&key_bytes);
         let our_pubkey = crate::crypto::pubkey_of(&sk);
 
-        // Generate a fresh ephemeral key pair for the Yggdrasil node so the
-        // routing address is not tied to the user's long-term identity key.
-        let ephemeral_seed: [u8; 32] = rand::random();
+        // Use the caller-supplied ephemeral key (so the app can persist the
+        // Yggdrasil routing address across restarts), or generate a fresh one.
+        let ephemeral_seed: [u8; 32] = match ephemeral_key {
+            Some(k) => k.try_into().map_err(|_| {
+                MimirError::Connection("ephemeral_key must be exactly 32 bytes".to_string())
+            })?,
+            None => rand::random(),
+        };
 
         // Start the Yggdrasil node with the ephemeral key.
         let node = rt
@@ -307,6 +317,7 @@ impl PeerNode {
             Arc::new(Mutex::new(HashMap::new()));
         let state = Arc::new(PeerState {
             our_pubkey,
+            ephemeral_seed,
             signing_key: Arc::clone(&sk),
             node: Arc::clone(&node),
             peer_port,
@@ -465,6 +476,13 @@ impl PeerNode {
     /// Our 32-byte Ed25519 public key (= Yggdrasil node identity).
     pub fn public_key(&self) -> Vec<u8> {
         self.state.our_pubkey.to_vec()
+    }
+
+    /// The 32-byte ephemeral seed used for the Yggdrasil node.
+    /// The app can persist this and pass it back on next start to keep the
+    /// same routing address across restarts.
+    pub fn ephemeral_key(&self) -> Vec<u8> {
+        self.state.ephemeral_seed.to_vec()
     }
 
     /// Replace the list of managed Yggdrasil router peers (priority = slice order).

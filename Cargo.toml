@@ -1,13 +1,13 @@
 [package]
 name = "mimir"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 authors = ["Revertron"]
 description = "Mimir messaging networking library (P2P + mediator)"
 license = "MPL-2.0"
 
 [dependencies]
-ygg_stream       = { git = "https://github.com/Revertron/ygg_stream", tag = "v0.1.9" }
+ygg_stream       = { git = "https://github.com/Revertron/ygg_stream", tag = "v0.2.0" }
 tokio            = { version = "1", features = ["full"] }
 uniffi           = { version = "0.31.0", features = ["build", "cli"] }
 ed25519-dalek    = { version = "2", features = ["rand_core"] }
