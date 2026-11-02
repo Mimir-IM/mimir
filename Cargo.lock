@@ -2713,6 +2713,7 @@ dependencies = [
 [[package]]
 name = "ygg_stream"
 version = "0.2.8"
+source = "git+https://github.com/Revertron/ygg_stream?tag=v0.2.8#94199be31bb099bde5a9cb4baed26544759bb5c7"
 dependencies = [
  "bytes",
  "ed25519-dalek",
